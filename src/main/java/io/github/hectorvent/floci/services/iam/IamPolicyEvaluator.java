@@ -822,6 +822,17 @@ public class IamPolicyEvaluator {
     // -----------------------------------------------------------------------
 
     /**
+     * Evaluates one statement's {@code Condition} element against a request context, with the
+     * same operator semantics as every other policy this class reads. For policies this class
+     * does not match statements for itself: trust policies carry no {@code Resource} element, so
+     * {@link AssumeRolePolicyEvaluator} matches their principal and action and asks here for the
+     * condition.
+     */
+    boolean conditionMatches(JsonNode condition, Map<String, List<String>> conditionCtx) {
+        return matchesConditions(parseConditions(condition), normalizeConditionContext(conditionCtx));
+    }
+
+    /**
      * Evaluates all condition blocks. AND between blocks, OR within each block's value list.
      * Returns true if ALL blocks pass (or there are no conditions).
      */
