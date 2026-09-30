@@ -102,10 +102,11 @@ import java.util.stream.Collectors;
 @ApplicationScoped
 public class EksClusterManager
         implements ClusterNodeInstanceProvider, VpcRouteTableListener, DnsClientVpcSource,
-        DnsRecordSource, DnsForwardingRuleSource {
+        DnsRecordSource, DnsForwardingRuleSource,
+        io.github.hectorvent.floci.services.ec2.EksNodeLauncher {
 
     private static final Logger LOG = Logger.getLogger(EksClusterManager.class);
-    private static final int K3S_API_SERVER_PORT = 6443;
+    private static final int K3S_API_SERVER_PORT = 443;
     static final String DEFAULT_NODE_INSTANCE_TYPE = "m5.large";
     private static final String NODE_CAPACITY_LABEL = "io.floci.eks.node-capacity";
     private static final String DEFAULT_STORAGE_CLASS_LABEL = "io.floci.eks.default-storage-class";
@@ -126,6 +127,13 @@ public class EksClusterManager
     static final String CONTAINERD_CERTS_LINK = "etc/containerd/certs.d";
     static final String POD_IDENTITY_MANIFEST_FILE = "floci-eks-pod-identity.yaml";
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
+    // Cluster DNS answers every amazonaws.com name with this address, and each node DNATs it to Floci.
+    // It covers SDKs that ignore AWS_ENDPOINT_URL, such as aws-sdk-go v1 in cluster-autoscaler.
+    static final String AWS_API_ADDRESS = "169.254.170.24";
+    static final String AWS_API_DNS_MANIFEST_TAR_ENTRY = "server/manifests/floci-aws-api-dns.yaml";
+    // k3s replaces a loopback node resolver with 8.8.8.8 for kubelet, so pods would bypass Floci DNS.
+    static final String RESOLV_CONF_TAR_ENTRY = "rancher/k3s/floci-resolv.conf";
+    static final String RESOLV_CONF_ARG = "--resolv-conf=/etc/" + RESOLV_CONF_TAR_ENTRY;
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
 
@@ -175,6 +183,9 @@ public class EksClusterManager
 
     @Inject
     jakarta.enterprise.inject.Instance<Ec2Service> ec2ServiceInstance;
+
+    @Inject
+    io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver currentContainerNetworkResolver;
     private Ec2Service ec2Service;
     private final StorageBackend<String, Nodegroup> nodeGroupStorage;
     private final Map<String, Set<String>> programmedClusterRoutes = new ConcurrentHashMap<>();
@@ -454,6 +465,7 @@ public class EksClusterManager
      */
     public boolean tryStartCluster(Cluster cluster) {
         try {
+            discardDeletedClusterData(cluster);
             startCluster(cluster);
             return true;
         } catch (RuntimeException e) {
@@ -466,6 +478,23 @@ public class EksClusterManager
                     + "to the endpoint it reports.", e.getMessage(), cluster.getName());
             return false;
         }
+    }
+
+    /**
+     * Removes a data volume that a deleted cluster of the same name left behind. A new cluster
+     * starts empty in AWS, and k3s cannot boot on another cluster's state.
+     */
+    private void discardDeletedClusterData(Cluster cluster) {
+        if (cluster.getDockerName() == null) {
+            cluster.setDockerName(accountQualifiedName(cluster));
+        }
+        String name = cluster.getDockerName();
+        if (!volumeExists(name)) {
+            return;
+        }
+        ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, name);
+        lifecycleManager.removeVolumeStrict(name);
+        LOG.infov("Removed data volume {0} left by a deleted EKS cluster of the same name", name);
     }
 
     /**
@@ -554,6 +583,17 @@ public class EksClusterManager
                 defaultStorageClass,
                 serviceCidr,
                 clusterCidr);
+        // endpoint-mode=network returns the container name as the endpoint, so the cert must cover it.
+        serverArgs.add("--tls-san=" + containerName);
+        serverArgs.add("--tls-san=" + eksHostname(cluster));
+        serverArgs.add("--https-listen-port=" + K3S_API_SERVER_PORT);
+        if (config.services().eks().workerNodes()) {
+            // EKS has no bundled load balancer or metrics-server; add-ons and charts supply them.
+            serverArgs.add("--disable=servicelb");
+            serverArgs.add("--disable=metrics-server");
+            // The EKS control plane runs no workloads, so pods must land on node groups or Karpenter nodes.
+            serverArgs.add("--node-taint=node-role.kubernetes.io/control-plane=true:NoSchedule");
+        }
 
         EksNodeCapacity.Limits nodeLimits = resolveNodeCapacity(cluster);
         if (nodeLimits != null) {
@@ -624,6 +664,7 @@ public class EksClusterManager
 
         if (config.services().eks().embeddedDns()) {
             specBuilder.withEmbeddedDns();
+            serverArgs.add(RESOLV_CONF_ARG);
         }
 
         if (config.services().eks().ecrRegistryMirror() && config.services().ecr().enabled()) {
@@ -707,7 +748,9 @@ public class EksClusterManager
         }
         injectEcrRegistryMirror(containerId, cluster.getName());
         linkContainerdCertsDir(containerId, cluster.getName());
+        injectResolvConf(containerId, spec, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
+        writeAwsApiDnsManifest(containerId, cluster);
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -723,6 +766,7 @@ public class EksClusterManager
         registerClusterNodeInstance(cluster, containerId);
         configureLinkLocalMetadataEndpoint(cluster, containerId);
         configurePodIdentityRelay(cluster, containerId);
+        routePodCidrFromFloci(cluster, containerId);
         activeClusters.put(clusterResourceName(cluster), cluster);
         configureVpcRoutes(cluster, containerId);
         attachClusterLogs(cluster);
@@ -811,6 +855,8 @@ public class EksClusterManager
         registerClusterNodeInstance(cluster, info.containerId());
         configureLinkLocalMetadataEndpoint(cluster, info.containerId());
         configurePodIdentityRelay(cluster, info.containerId());
+        routePodCidrFromFloci(cluster, info.containerId());
+        restoreWorkerNodes(cluster);
         activeClusters.put(clusterResourceName(cluster), cluster);
         configureVpcRoutes(cluster, info.containerId());
         attachClusterLogsFromNow(cluster);
@@ -899,6 +945,10 @@ public class EksClusterManager
         cluster.setEndpoint(resolvePublicEndpoint(
                 containerDetector.isRunningInContainer(), config.services().eks().endpointMode(),
                 containerName, hostPort));
+        if (containerDetector.isRunningInContainer()
+                && ENDPOINT_MODE_NETWORK.equalsIgnoreCase(config.services().eks().endpointMode())) {
+            cluster.setEndpoint("https://" + eksHostname(cluster));
+        }
 
         if (containerDetector.isRunningInContainer()) {
             ContainerLifecycleManager.EndpointInfo ep = info.getEndpoint(K3S_API_SERVER_PORT);
@@ -968,6 +1018,24 @@ public class EksClusterManager
             LOG.warnv("Could not extract kubeconfig for cluster {0}: {1}",
                     cluster.getName(), e.getMessage());
         }
+        removeReplacedServerNodes(cluster, containerId);
+    }
+
+    /**
+     * Deletes control-plane nodes of earlier k3s containers. The node name is the container
+     * hostname, so a replaced server leaves a NotReady node whose pods never terminate.
+     */
+    private void removeReplacedServerNodes(Cluster cluster, String containerId) {
+        String script = "for n in $(kubectl get nodes -l node-role.kubernetes.io/control-plane"
+                + " -o jsonpath='{.items[*].metadata.name}'); do"
+                + " [ \"$n\" = \"$(hostname)\" ] || kubectl delete node \"$n\" --wait=false; done";
+        ContainerExec.Result result = execInContainerForResult(containerId, new String[]{"sh", "-c", script}, 30);
+        if (result.exitCode() != 0) {
+            LOG.warnv("Could not remove replaced server nodes of EKS cluster {0}: {1}",
+                    cluster.getName(), result.summary());
+        } else if (!result.stdout().isBlank()) {
+            LOG.infov("Removed replaced server nodes of EKS cluster {0}: {1}", cluster.getName(), result.stdout().trim());
+        }
     }
 
     private void pruneLegacyClusterNodes(Cluster cluster, String containerId) {
@@ -1003,6 +1071,9 @@ public class EksClusterManager
      */
     public void stopCluster(Cluster cluster) {
         String resourceName = clusterResourceName(cluster);
+        if (cluster.getDockerName() != null) {
+            stopAllWorkerNodes(cluster);
+        }
         if (cluster.getContainerId() == null) {
             unregisterMetadataEndpoint(cluster);
             closeQuietly(clusterLogHandles.remove(resourceName));
@@ -1513,7 +1584,7 @@ public class EksClusterManager
                 .toAbsolutePath().normalize();
         try {
             Files.createDirectories(localFile.getParent());
-            Files.writeString(localFile, buildWebhookKubeconfig("http://" + dockerHostResolver.resolve() + ":"
+            Files.writeString(localFile, buildWebhookKubeconfig("http://" + flociHostForClusters() + ":"
                     + config.port() + webhookPath(cluster, clusterRegion(cluster))));
         } catch (IOException e) {
             LOG.warnv("EKS token-webhook disabled for cluster {0}: could not write kubeconfig: {1}",
@@ -1940,29 +2011,16 @@ public class EksClusterManager
      * mirror for this cluster but does not abort its startup, matching the webhook contract.
      */
     void injectEcrRegistryMirror(String containerId, String clusterName) {
-        if (!config.services().eks().ecrRegistryMirror() || !config.services().ecr().enabled()) {
+        String content = clusterRegistriesYaml(clusterName);
+        if (content == null) {
             return;
         }
-        try {
-            ecrRegistryManager.ensureStarted();
-        } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} gets no ECR registry mirror: registry unavailable: {1}",
-                    clusterName, e.getMessage());
-            return;
-        }
-        List<String> regions = new ArrayList<>(AwsRegions.advertised(AwsRegions.partitionFor(config.defaultRegion())));
-        if (!regions.contains(config.defaultRegion())) {
-            regions.add(config.defaultRegion());
-        }
-        String endpoint = "http://" + dockerHostResolver.resolve() + ":" + config.port();
-        boolean tlsUri = config.services().ecr().tlsUri() && config.tls().enabled();
-        String content = buildRegistriesYaml(config.defaultAccountId(), regions, config.port(), endpoint, tlsUri);
         writeLocalCopy(Paths.get(config.services().eks().dataPath(), "registries", clusterName,
                 "registries.yaml"), content, clusterName);
         try {
             RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, "/etc",
                     REGISTRIES_TAR_ENTRY, content.getBytes(StandardCharsets.UTF_8), 0644);
-            LOG.infov("Injected ECR registry mirror ({0}) into k3s cluster {1}", endpoint, clusterName);
+            LOG.infov("Injected registry mirrors into k3s cluster {0}", clusterName);
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no ECR registry mirror: could not copy registries.yaml "
                     + "into the k3s container: {1}", clusterName, e.getMessage());
@@ -2017,6 +2075,56 @@ public class EksClusterManager
     }
 
     /**
+     * The registries.yaml every node of a cluster uses, or null when no mirror applies. It holds
+     * the Floci ECR mirrors and, with worker nodes on, the public mirror of the EKS add-on registry.
+     */
+    String clusterRegistriesYaml(String clusterName) {
+        List<String> regions = new ArrayList<>(AwsRegions.advertised(AwsRegions.partitionFor(config.defaultRegion())));
+        if (!regions.contains(config.defaultRegion())) {
+            regions.add(config.defaultRegion());
+        }
+        StringBuilder content = new StringBuilder();
+        if (config.services().eks().ecrRegistryMirror() && config.services().ecr().enabled()) {
+            try {
+                ecrRegistryManager.ensureStarted();
+                String endpoint = "http://" + flociHostForClusters() + ":" + config.port();
+                boolean tlsUri = config.services().ecr().tlsUri() && config.tls().enabled();
+                content.append(buildRegistriesYaml(config.defaultAccountId(), regions, config.port(), endpoint, tlsUri));
+            } catch (Exception e) {
+                LOG.warnv("EKS cluster {0} gets no ECR registry mirror: registry unavailable: {1}",
+                        clusterName, e.getMessage());
+            }
+        }
+        if (config.services().eks().workerNodes()) {
+            if (content.isEmpty()) {
+                content.append("mirrors:\n");
+            }
+            content.append(buildEksAddonRegistryMirrors(regions));
+        }
+        return content.isEmpty() ? null : content.toString();
+    }
+
+    /** The account that hosts the EKS add-on images, such as the AWS Load Balancer Controller. */
+    static final String EKS_ADDON_REGISTRY_ACCOUNT = "602401143452";
+
+    /**
+     * Mirrors the EKS add-on registry to its public copy. The public copy serves the same digests,
+     * but it keeps the {@code amazon/} images under {@code eks/}.
+     */
+    static String buildEksAddonRegistryMirrors(List<String> regions) {
+        StringBuilder yaml = new StringBuilder();
+        for (String region : regions) {
+            yaml.append("  \"").append(EKS_ADDON_REGISTRY_ACCOUNT).append(".dkr.ecr.").append(region)
+                    .append(".amazonaws.com\":\n")
+                    .append("    endpoint:\n")
+                    .append("      - \"https://public.ecr.aws\"\n")
+                    .append("    rewrite:\n")
+                    .append("      \"^amazon/(.*)\": \"eks/$1\"\n");
+        }
+        return yaml.toString();
+    }
+
+    /**
      * Drops the cluster's {@code MutatingWebhookConfiguration} into the k3s server manifests
      * directory of the (created, not-yet-started) container, so the API server registers it as it
      * comes up and starts sending pod CREATE admission reviews to Floci.
@@ -2043,7 +2151,9 @@ public class EksClusterManager
                     + "put in the webhook caBundle", clusterName);
             return;
         }
-        String url = "https://" + dockerHostResolver.resolve() + ":" + config.port()
+        // The TLS certificate names the configured hostname but not Floci's container addresses.
+        String webhookHost = config.hostname().filter(h -> !h.isBlank()).orElseGet(this::flociHostForClusters);
+        String url = "https://" + webhookHost + ":" + config.port()
                 + podIdentityWebhookPath(clusterName, resolveClusterAccountId(cluster));
         String manifest = buildPodIdentityWebhookConfiguration(url, certificateAuthority.caPem());
         writeLocalCopy(Paths.get(config.services().eks().dataPath(), "webhook", clusterName,
@@ -2060,6 +2170,64 @@ public class EksClusterManager
             LOG.warnv("EKS cluster {0} gets no pod identity injection: could not copy {1} into the k3s "
                     + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
         }
+    }
+
+    /** Gives kubelet the Floci resolver only, since k3s drops a loopback one and CoreDNS forwards at random. */
+    void injectResolvConf(String containerId, ContainerSpec spec, String nodeName) {
+        if (!config.services().eks().embeddedDns()) {
+            return;
+        }
+        String nameserver = spec.dnsServers() == null || spec.dnsServers().isEmpty()
+                ? "8.8.8.8" : spec.dnsServers().getFirst();
+        try {
+            lifecycleManager.getDockerClient()
+                    .copyArchiveToContainerCmd(containerId)
+                    .withTarInputStream(new ByteArrayInputStream(
+                            tarSingleFile(RESOLV_CONF_TAR_ENTRY, "nameserver " + nameserver + "\n")))
+                    .withRemotePath("/etc")
+                    .exec();
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not write the kubelet resolv.conf for " + nodeName, e);
+        }
+    }
+
+    /** Makes the k3s CoreDNS import a server block that resolves amazonaws.com names to Floci. */
+    void writeAwsApiDnsManifest(String containerId, Cluster cluster) {
+        if (!workerNodesEnabled() || !config.tls().enabled()) {
+            return;
+        }
+        try {
+            lifecycleManager.getDockerClient()
+                    .copyArchiveToContainerCmd(containerId)
+                    .withTarInputStream(new ByteArrayInputStream(
+                            tarSingleFile(AWS_API_DNS_MANIFEST_TAR_ENTRY, awsApiDnsManifest())))
+                    .withRemotePath(K3S_DATA_DIR)
+                    .exec();
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} pods resolve amazonaws.com to AWS itself: could not copy the DNS "
+                    + "manifest into the k3s container: {1}", cluster.getName(), e.getMessage());
+        }
+    }
+
+    static String awsApiDnsManifest() {
+        return """
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: coredns-custom
+                  namespace: kube-system
+                data:
+                  floci-aws-api.server: |
+                    amazonaws.com:53 {
+                        errors
+                        template IN A amazonaws.com {
+                            answer "{{ .Name }} 60 IN A %s"
+                        }
+                        template IN AAAA amazonaws.com {
+                            rcode NOERROR
+                        }
+                    }
+                """.formatted(AWS_API_ADDRESS);
     }
 
     /**
@@ -2172,7 +2340,7 @@ public class EksClusterManager
 
     /** The Floci token-webhook URL as reachable from inside the k3s container. */
     String webhookUrl(String clusterName) {
-        return "http://" + dockerHostResolver.resolve() + ":" + config.port() + webhookPath(clusterName);
+        return "http://" + flociHostForClusters() + ":" + config.port() + webhookPath(clusterName);
     }
 
     /** The cluster's ARN names its region; {@code defaultRegion} answers for a cluster without one. */
@@ -2267,7 +2435,7 @@ public class EksClusterManager
                 return;
             }
 
-            String flociHost = dockerHostResolver.resolve();
+            String flociHost = flociHostForClusters();
             int imdsPort = config.services().ec2().imdsPort();
 
             ContainerExec.Result start = execInContainerForResult(containerId,
@@ -2293,6 +2461,10 @@ public class EksClusterManager
         if (!config.services().eks().podIdentityWebhook() || !config.tls().enabled()) {
             return;
         }
+        if (workerNodesEnabled()) {
+            configureLinkLocalForwarding(cluster, containerId);
+            return;
+        }
         try {
             ContainerExec.Result install = execInContainerForResult(containerId,
                     Ec2MetadataProxy.installCommand(), 180);
@@ -2302,7 +2474,7 @@ public class EksClusterManager
                 return;
             }
 
-            String flociHost = dockerHostResolver.resolve();
+            String flociHost = flociHostForClusters();
             int flociPort = config.port();
 
             ContainerExec.Result start = execInContainerForResult(containerId,
@@ -2473,6 +2645,12 @@ public class EksClusterManager
         if (metadataServer != null && nodeInstance != null) {
             metadataServer.unregisterInstance(nodeInstance);
         }
+    }
+
+    /** An EKS-shaped hostname; the network's DNS maps it to the cluster container. */
+    String eksHostname(Cluster cluster) {
+        return cluster.getName() + "-" + resolveClusterAccountId(cluster) + ".gr7."
+                + clusterRegion(cluster) + ".eks.amazonaws.com";
     }
 
     String clusterRegion(Cluster cluster) {
@@ -2820,6 +2998,713 @@ public class EksClusterManager
                 .filter(rec -> region == null || region.equals(rec.region()))
                 .map(ClusterNodeRecord::instance)
                 .toList();
+    }
+
+    // ── Worker nodes ────────────────────────────────────────────────────────────
+
+    public boolean workerNodesEnabled() {
+        return config.services().eks().workerNodes() && !config.services().eks().mock();
+    }
+
+    /**
+     * Routes the cluster's pod CIDR from Floci to the k3s server, so load balancers can reach IP targets.
+     * The server masquerades that traffic, so replies from pods on any node come back through it.
+     */
+    void routePodCidrFromFloci(Cluster cluster, String serverId) {
+        if (!workerNodesEnabled()) {
+            return;
+        }
+        String network = eksDockerNetwork();
+        Optional<String> self = currentContainerNetworkResolver != null
+                ? currentContainerNetworkResolver.resolveContainerId() : Optional.empty();
+        Optional<String> flociIp = flociClusterAddress();
+        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        if (network == null || self.isEmpty() || flociIp.isEmpty() || dockerClient == null) {
+            LOG.warnv("Floci does not run in a container on the EKS network; cluster {0} pod IPs stay unreachable",
+                    cluster.getName());
+            return;
+        }
+        String podCidr = cluster.getPodCidr() != null && !cluster.getPodCidr().isBlank()
+                ? cluster.getPodCidr() : DEFAULT_POD_CIDR;
+        String helperId = null;
+        try {
+            String serverIp = lifecycleManager.resolveContainerNetworkIp(serverId, network);
+            ContainerExec.Result masquerade = execInContainerForResult(serverId, new String[]{"sh", "-c",
+                    "iptables -t nat -C POSTROUTING -s " + flociIp.get() + "/32 -d " + podCidr + " -j MASQUERADE"
+                            + " 2>/dev/null || iptables -t nat -I POSTROUTING 1 -s " + flociIp.get() + "/32 -d "
+                            + podCidr + " -j MASQUERADE"}, 15);
+            if (masquerade.exitCode() != 0) {
+                LOG.warnv("Could not masquerade Floci traffic on EKS cluster {0}: {1}",
+                        cluster.getName(), masquerade.summary());
+                return;
+            }
+            // Floci has no NET_ADMIN, so a short-lived helper in its network namespace edits the route table.
+            helperId = dockerClient.createContainerCmd(resolveClusterImage(cluster))
+                    .withEntrypoint("ip")
+                    .withCmd("route", "replace", podCidr, "via", serverIp)
+                    .withHostConfig(com.github.dockerjava.api.model.HostConfig.newHostConfig()
+                            .withNetworkMode("container:" + self.get())
+                            .withCapAdd(com.github.dockerjava.api.model.Capability.NET_ADMIN))
+                    .exec().getId();
+            dockerClient.startContainerCmd(helperId).exec();
+            Integer exit = dockerClient.waitContainerCmd(helperId)
+                    .exec(new com.github.dockerjava.api.command.WaitContainerResultCallback())
+                    .awaitStatusCode(30, java.util.concurrent.TimeUnit.SECONDS);
+            if (exit == null || exit != 0) {
+                LOG.warnv("Could not route pod CIDR {0} to EKS cluster {1}: exit {2}",
+                        podCidr, cluster.getName(), String.valueOf(exit));
+                return;
+            }
+            LOG.infov("Routed pod CIDR {0} through k3s server {1} for EKS cluster {2}",
+                    podCidr, serverIp, cluster.getName());
+        } catch (Exception e) {
+            LOG.warnv("Could not route pod CIDR to EKS cluster {0}: {1}", cluster.getName(), e.getMessage());
+        } finally {
+            if (helperId != null) {
+                try {
+                    dockerClient.removeContainerCmd(helperId).withForce(true).exec();
+                } catch (Exception ignored) {
+                    // The helper is gone already.
+                }
+            }
+        }
+    }
+
+    /**
+     * Floci's address as cluster containers reach it. Floci joins every VPC network too,
+     * so the resolver's first address can be one that a cluster does not share.
+     */
+    String flociHostForClusters() {
+        return flociClusterAddress().orElseGet(dockerHostResolver::resolve);
+    }
+
+    /** The network cluster containers join: the EKS setting, else the global one, else Floci's own. */
+    String eksDockerNetwork() {
+        return containerBuilder.resolveDockerNetwork(config.services().eks().dockerNetwork()).orElse(null);
+    }
+
+    static final String AWS_API_GATEWAY_NAME = "floci-aws-api-gateway";
+
+    /** STS hostnames that aws-sdk-go v1 dials directly, since it has no endpoint override for STS. */
+    static List<String> awsApiGatewayHostnames() {
+        List<String> names = new ArrayList<>();
+        names.add("sts.amazonaws.com");
+        AwsRegions.advertised(AwsRegions.DEFAULT_PARTITION).stream().sorted().forEach(region -> names.add("sts." + region + ".amazonaws.com"));
+        return names;
+    }
+
+    /**
+     * Starts a container that answers for STS hostnames on the EKS Docker network and forwards
+     * HTTPS to Floci. Other containers on that network then reach Floci STS under the real names.
+     */
+    public void startAwsApiGateway() {
+        String network = eksDockerNetwork();
+        Optional<String> flociIp = flociClusterAddress();
+        DockerClient docker = lifecycleManager.getDockerClient();
+        if (!workerNodesEnabled() || !config.tls().enabled() || network == null || flociIp.isEmpty()
+                || docker == null) {
+            return;
+        }
+        String image = resolveClusterImage(null);
+        try {
+            lifecycleManager.removeIfExistsStrict(AWS_API_GATEWAY_NAME);
+            try {
+                docker.inspectImageCmd(image).exec();
+            } catch (com.github.dockerjava.api.exception.NotFoundException missing) {
+                docker.pullImageCmd(image).exec(new com.github.dockerjava.api.command.PullImageResultCallback())
+                        .awaitCompletion(5, java.util.concurrent.TimeUnit.MINUTES);
+            }
+            String target = flociIp.get() + ":" + config.port();
+            String script = "IPT=$(command -v iptables || echo /bin/aux/iptables)\n"
+                    + "$IPT -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination " + target + "\n"
+                    + "$IPT -t nat -A POSTROUTING -d " + flociIp.get() + "/32 -j MASQUERADE\n"
+                    + "exec sleep infinity\n";
+            String id = docker.createContainerCmd(image)
+                    .withName(AWS_API_GATEWAY_NAME)
+                    .withEntrypoint("sh", "-c", script)
+                    .withAliases(awsApiGatewayHostnames())
+                    .withHostConfig(com.github.dockerjava.api.model.HostConfig.newHostConfig()
+                            .withNetworkMode(network)
+                            .withRestartPolicy(com.github.dockerjava.api.model.RestartPolicy.unlessStoppedRestart())
+                            .withSysctls(Map.of("net.ipv4.ip_forward", "1"))
+                            .withCapAdd(com.github.dockerjava.api.model.Capability.NET_ADMIN))
+                    .exec().getId();
+            docker.startContainerCmd(id).exec();
+            LOG.infov("AWS API gateway answers for STS hostnames on network {0} and forwards to {1}",
+                    network, target);
+        } catch (Exception e) {
+            LOG.warnv("Could not start the AWS API gateway on network {0}: {1}", network, e.getMessage());
+        }
+    }
+
+    /** Floci's IP on the EKS Docker network, which every node and pod can reach. */
+    Optional<String> flociClusterAddress() {
+        String network = eksDockerNetwork();
+        Optional<String> self = currentContainerNetworkResolver != null
+                ? currentContainerNetworkResolver.resolveContainerId() : Optional.empty();
+        if (self.isPresent() && network != null) {
+            try {
+                String ip = lifecycleManager.resolveContainerNetworkIp(self.get(), network);
+                if (ip != null && !ip.isBlank()) {
+                    return Optional.of(ip);
+                }
+            } catch (Exception e) {
+                LOG.debugv("Could not resolve Floci's address on network {0}: {1}", network, e.getMessage());
+            }
+        }
+        String fallback = dockerHostResolver.resolve();
+        return fallback == null || fallback.isBlank() ? Optional.empty() : Optional.of(fallback);
+    }
+
+    /** The AWS endpoint URL that pods use to reach Floci. */
+    public Optional<String> flociClusterEndpoint() {
+        return flociClusterAddress().map(ip -> "http://" + ip + ":" + config.port());
+    }
+
+    /**
+     * Forwards the link-local credential and metadata endpoints on one node to Floci with DNAT.
+     * The k3s image has iptables but no package manager, so no relay process is installed.
+     */
+    void configureLinkLocalForwarding(Cluster cluster, String containerId) {
+        Optional<String> floci = flociClusterAddress();
+        if (floci.isEmpty()) {
+            LOG.warnv("EKS cluster {0} gets no link-local endpoints: Floci has no address on its network",
+                    cluster.getName());
+            return;
+        }
+        Integer imdsPort = config.services().eks().imds() ? config.services().ec2().imdsPort() : null;
+        String script = linkLocalForwardingScript(floci.get(), config.port(), imdsPort);
+        ContainerExec.Result result = execInContainerForResult(containerId, new String[]{"sh", "-c", script}, 30);
+        if (result.exitCode() != 0) {
+            LOG.warnv("Could not forward link-local endpoints for EKS cluster {0}: {1}",
+                    cluster.getName(), result.summary());
+            return;
+        }
+        awsApiClients.addAll(resolveContainerIps(containerId).allIps());
+        LOG.infov("Forwarded link-local endpoints on a node of EKS cluster {0} to {1}", cluster.getName(), floci.get());
+    }
+
+    /** Addresses of nodes that forward {@link #AWS_API_ADDRESS} to Floci. */
+    private final Set<String> awsApiClients = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** True when the address belongs to a node whose AWS API traffic reaches Floci. */
+    public boolean forwardsAwsApi(String address) {
+        return awsApiClients.contains(address);
+    }
+
+    /**
+     * The iptables commands that send 169.254.170.23 (pod identity) and, when set, 169.254.169.254
+     * (IMDS) to Floci. OUTPUT covers host-network pods and PREROUTING covers the rest.
+     */
+    static String linkLocalForwardingScript(String flociIp, int flociPort, Integer imdsPort) {
+        StringBuilder rules = new StringBuilder();
+        rules.append("-d 169.254.170.23/32 -p tcp --dport 80 -j DNAT --to-destination ")
+                .append(flociIp).append(':').append(flociPort).append('\n');
+        rules.append("-d ").append(AWS_API_ADDRESS).append("/32 -p tcp --dport 443 -j DNAT --to-destination ")
+                .append(flociIp).append(':').append(flociPort).append('\n');
+        if (imdsPort != null) {
+            rules.append("-d 169.254.169.254/32 -p tcp --dport 80 -j DNAT --to-destination ")
+                    .append(flociIp).append(':').append(imdsPort).append('\n');
+        }
+        return """
+                set -e
+                IPT=$(command -v iptables || echo /bin/aux/iptables)
+                for hook in PREROUTING OUTPUT; do
+                  chain=FLOCI-EKS-LL-$hook
+                  $IPT -t nat -N $chain 2>/dev/null || $IPT -t nat -F $chain
+                  $IPT -t nat -C $hook -j $chain 2>/dev/null || $IPT -t nat -I $hook 1 -j $chain
+                  printf '%s' '%s' | while read -r rule; do
+                    [ -n "$rule" ] && $IPT -t nat -A $chain $rule
+                  done
+                done
+                $IPT -t nat -C POSTROUTING -d %s/32 -j MASQUERADE 2>/dev/null \
+                  || $IPT -t nat -I POSTROUTING 1 -d %s/32 -j MASQUERADE
+                """.formatted("%s", rules.toString(), flociIp, flociIp);
+    }
+
+    /** What EKS or Karpenter asks of one worker node. Taints use the kubelet form key=value:Effect. */
+    public record WorkerNodeSpec(String instanceId, String availabilityZone, String instanceType,
+                                 String subnetId, Map<String, String> labels, List<String> taints) {}
+
+    /** Label domains the kubelet may not set on its own node. */
+    private static final List<String> RESTRICTED_LABEL_DOMAINS = List.of("kubernetes.io/", "k8s.io/");
+    private static final List<String> ALLOWED_RESTRICTED_LABELS = List.of(
+            "kubernetes.io/arch", "kubernetes.io/os", "kubernetes.io/hostname",
+            "beta.kubernetes.io/arch", "beta.kubernetes.io/os", "beta.kubernetes.io/instance-type",
+            "node.kubernetes.io/instance-type", "failure-domain.beta.kubernetes.io/zone",
+            "failure-domain.beta.kubernetes.io/region", "topology.kubernetes.io/zone",
+            "topology.kubernetes.io/region");
+
+    /** True when the kubelet may register the label; others make it refuse to start. */
+    static boolean kubeletMaySetLabel(String key) {
+        int slash = key.indexOf('/');
+        if (slash < 0) {
+            return true;
+        }
+        String domain = key.substring(0, slash + 1);
+        boolean restricted = RESTRICTED_LABEL_DOMAINS.stream()
+                .anyMatch(d -> domain.equals(d) || domain.endsWith("." + d));
+        boolean kubeletNamespace = domain.endsWith("kubelet.kubernetes.io/") || domain.endsWith("node.kubernetes.io/");
+        return !restricted || kubeletNamespace || ALLOWED_RESTRICTED_LABELS.contains(key);
+    }
+
+    /** Kubelet reservations and the cores a worker node may use, sized like its instance type. */
+    record WorkerCapacity(EksNodeCapacity.Limits limits, String cpuset) {}
+
+    /**
+     * Sizes a worker node as its instance type. The node sees only its own vCPUs, so software that
+     * sizes itself from the core count behaves as it does on EC2.
+     */
+    WorkerCapacity resolveWorkerCapacity(String instanceType, String instanceId) {
+        try {
+            Info host = lifecycleManager.getDockerClient().infoCmd().exec();
+            CatalogInstanceType type = instanceTypeCatalog.find(instanceType).orElse(null);
+            if (type == null || host.getNCPU() == null || host.getMemTotal() == null) {
+                return null;
+            }
+            // The kubelet still counts every host core, so the reservations cover the cores outside the cpuset.
+            EksNodeCapacity.Limits limits = EksNodeCapacity.calculate(type, host.getMemTotal(), host.getNCPU(),
+                    config.services().eks().maxMemoryMib(), config.services().eks().maxVcpus());
+            if (limits == null) {
+                return null;
+            }
+            return new WorkerCapacity(limits, workerCpuset(instanceId, limits.vcpus(), host.getNCPU()));
+        } catch (Exception e) {
+            LOG.warnv("Worker node {0} starts without instance limits: {1}", instanceId, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Spreads nodes over the host cores, starting from a core chosen by the instance ID. */
+    static String workerCpuset(String instanceId, int vcpus, int hostCpus) {
+        int start = Math.floorMod(instanceId.hashCode(), hostCpus);
+        List<String> cores = new ArrayList<>();
+        for (int i = 0; i < Math.min(vcpus, hostCpus); i++) {
+            cores.add(String.valueOf((start + i) % hostCpus));
+        }
+        return String.join(",", cores);
+    }
+
+    static String workerNodeName(String instanceId, String region) {
+        return instanceId + "." + region + ".compute.internal";
+    }
+
+    String workerContainerName(Cluster cluster, String instanceId) {
+        return cluster.getDockerName() + "-" + instanceId;
+    }
+
+    /**
+     * Starts one k3s agent container that joins the cluster as a worker node. The node carries the
+     * provider ID, labels and taints a real EKS node would have.
+     *
+     * @param registerInstance true when EKS owns the node and EC2 has no record of it yet
+     * @return the EC2 instance view of the node
+     */
+    public Instance startWorkerNode(Cluster cluster, WorkerNodeSpec spec, boolean registerInstance) {
+        String serverId = cluster.getContainerId();
+        if (serverId == null) {
+            throw new IllegalStateException("EKS cluster " + cluster.getName() + " has no k3s server");
+        }
+        ContainerExec.Result tokenRead = execInContainerForResult(serverId,
+                new String[]{"cat", K3S_DATA_DIR + "/server/node-token"}, 10);
+        if (tokenRead.exitCode() != 0 || tokenRead.stdout().isBlank()) {
+            throw new IllegalStateException("Could not read the k3s join token: " + tokenRead.summary());
+        }
+        String token = tokenRead.stdout().trim();
+        String network = eksDockerNetwork();
+        String serverIp = lifecycleManager.resolveContainerNetworkIp(serverId, network);
+        String region = clusterRegion(cluster);
+        String accountId = resolveClusterAccountId(cluster);
+        String instanceType = spec.instanceType() != null ? spec.instanceType() : DEFAULT_NODE_INSTANCE_TYPE;
+
+        Map<String, String> nodeLabels = new LinkedHashMap<>();
+        nodeLabels.put("topology.kubernetes.io/region", region);
+        nodeLabels.put("topology.kubernetes.io/zone", spec.availabilityZone());
+        nodeLabels.put("node.kubernetes.io/instance-type", instanceType);
+        if (spec.labels() != null) {
+            nodeLabels.putAll(spec.labels());
+        }
+        List<String> args = new ArrayList<>(List.of("agent",
+                "--node-name=" + workerNodeName(spec.instanceId(), region),
+                "--kubelet-arg=provider-id=aws:///" + spec.availabilityZone() + "/" + spec.instanceId()));
+        nodeLabels.forEach((key, value) -> {
+            if (kubeletMaySetLabel(key)) {
+                args.add("--node-label=" + key + "=" + value);
+            } else {
+                LOG.debugv("Worker node {0} skips label {1}: the kubelet may not set it", spec.instanceId(), key);
+            }
+        });
+        if (spec.taints() != null) {
+            spec.taints().forEach(taint -> args.add("--node-taint=" + taint));
+        }
+        WorkerCapacity capacity = resolveWorkerCapacity(instanceType, spec.instanceId());
+        if (capacity != null) {
+            capacity.limits().addKubeletArgs(args);
+        }
+        if (config.services().eks().embeddedDns()) {
+            args.add(RESOLV_CONF_ARG);
+        }
+
+        String name = workerContainerName(cluster, spec.instanceId());
+        Map<String, String> dockerLabels = new LinkedHashMap<>(ContainerStorageHelper.resourceIdentityLabels(
+                "eks", cluster.getName(), accountId, region));
+        dockerLabels.put(WORKER_NODE_LABEL, spec.instanceId());
+        dockerLabels.put(WORKER_NODE_LABEL + ".zone", spec.availabilityZone());
+        dockerLabels.put(WORKER_NODE_LABEL + ".instance-type", instanceType);
+        dockerLabels.put(WORKER_NODE_LABEL + ".registered", String.valueOf(registerInstance));
+        if (spec.subnetId() != null) {
+            dockerLabels.put(WORKER_NODE_LABEL + ".subnet", spec.subnetId());
+        }
+        if (spec.labels() != null && spec.labels().get(NODEGROUP_LABEL) != null) {
+            dockerLabels.put(WORKER_NODE_LABEL + ".nodegroup", spec.labels().get(NODEGROUP_LABEL));
+        }
+        var workerBuilder = containerBuilder.newContainer(resolveClusterImage(cluster))
+                .withName(name)
+                .withEnv("K3S_URL", "https://" + serverIp + ":" + K3S_API_SERVER_PORT)
+                .withEnv("K3S_TOKEN", token)
+                .withDockerNetwork(config.services().eks().dockerNetwork())
+                .withPrivileged(true)
+                .withLogRotation()
+                .withLabels(dockerLabels)
+                .withCmd(args);
+        if (capacity != null && capacity.limits().memoryBytes() > 0) {
+            workerBuilder.withMemoryBytes(capacity.limits().memoryBytes());
+        }
+        if (config.services().eks().embeddedDns()) {
+            // The node resolver answers AWS hostnames; node-local-dns forwards to it, not CoreDNS.
+            workerBuilder.withEmbeddedDns();
+        }
+        ContainerSpec containerSpec = workerBuilder.build();
+        ContainerStorageHelper.removeStaleContainer(config, lifecycleManager, name);
+        String containerId = lifecycleManager.create(containerSpec);
+        if (capacity != null && capacity.cpuset() != null) {
+            lifecycleManager.getDockerClient().updateContainerCmd(containerId)
+                    .withCpusetCpus(capacity.cpuset()).exec();
+        }
+        String registries = clusterRegistriesYaml(cluster.getName());
+        if (registries != null) {
+            try {
+                lifecycleManager.getDockerClient()
+                        .copyArchiveToContainerCmd(containerId)
+                        .withTarInputStream(new ByteArrayInputStream(tarSingleFile(REGISTRIES_TAR_ENTRY, registries)))
+                        .withRemotePath("/etc")
+                        .exec();
+            } catch (Exception e) {
+                LOG.warnv("Worker node {0} gets no registry mirrors: {1}", spec.instanceId(), e.getMessage());
+            }
+        }
+        injectResolvConf(containerId, containerSpec, name);
+        try {
+            lifecycleManager.startCreated(containerId, containerSpec);
+        } catch (RuntimeException e) {
+            lifecycleManager.removeIfExists(name);
+            throw e;
+        }
+        String ip = lifecycleManager.resolveContainerNetworkIp(containerId, network);
+        configureLinkLocalForwarding(cluster, containerId);
+        Instance node = workerInstance(cluster, spec.instanceId(), spec.availabilityZone(), instanceType,
+                spec.subnetId(), ip, containerId);
+        if (registerInstance) {
+            registerWorkerInstance(cluster, node);
+        }
+        LOG.infov("Started worker node {0} ({1}) for EKS cluster {2}", spec.instanceId(), ip, cluster.getName());
+        return node;
+    }
+
+    private Instance workerInstance(Cluster cluster, String instanceId, String availabilityZone, String instanceType,
+                                    String subnetId, String ip, String containerId) {
+        String region = clusterRegion(cluster);
+        String accountId = resolveClusterAccountId(cluster);
+        Instance node = new Instance();
+        node.setInstanceId(instanceId);
+        node.setImageId("ami-eks-k3s");
+        node.setInstanceType(instanceType);
+        node.setPlacement(new Placement(availabilityZone));
+        node.setRegion(region);
+        node.setState(InstanceState.running());
+        node.setPrivateIpAddress(ip);
+        node.setPrivateDnsName(workerNodeName(instanceId, region));
+        node.setDockerContainerId(containerId);
+        node.setIamInstanceProfileArn(regionResolver.buildGlobalArn("iam", accountId,
+                "instance-profile/" + cluster.getName() + "-node-profile"));
+        if (cluster.getResourcesVpcConfig() != null) {
+            node.setVpcId(cluster.getResourcesVpcConfig().getVpcId());
+        }
+        node.setSubnetId(subnetId);
+        node.setLaunchTime(Instant.now());
+        node.setTags(new ArrayList<>(List.of(
+                new Tag("Name", cluster.getName() + "-node"),
+                new Tag("kubernetes.io/cluster/" + cluster.getName(), "owned"),
+                new Tag("eks:cluster-name", cluster.getName()))));
+        return node;
+    }
+
+    private void registerWorkerInstance(Cluster cluster, Instance node) {
+        clusterNodeInstances.put(workerRecordKey(cluster, node.getInstanceId()),
+                new ClusterNodeRecord(resolveClusterAccountId(cluster), clusterRegion(cluster), node));
+        for (Consumer<Instance> listener : nodeRegistrationListeners) {
+            try {
+                listener.accept(node);
+            } catch (Exception e) {
+                LOG.warnv("Node registration listener failed for worker node {0}: {1}",
+                        node.getInstanceId(), e.getMessage());
+            }
+        }
+    }
+
+    /** The cluster's worker node containers, running or not. */
+    private List<com.github.dockerjava.api.model.Container> workerContainers(Cluster cluster) {
+        String prefix = "/" + cluster.getDockerName() + "-i-";
+        return lifecycleManager.getDockerClient().listContainersCmd().withShowAll(true)
+                .withLabelFilter(List.of(WORKER_NODE_LABEL)).exec().stream()
+                .filter(c -> c.getNames() != null && java.util.Arrays.stream(c.getNames()).anyMatch(n -> n.startsWith(prefix)))
+                .toList();
+    }
+
+    /**
+     * Re-latches worker nodes that outlived a Floci restart. Floci's address can change, so each node
+     * gets its forwarding again, and node group workers get their EC2 records back.
+     */
+    void restoreWorkerNodes(Cluster cluster) {
+        if (!workerNodesEnabled()) {
+            return;
+        }
+        try {
+            for (var container : workerContainers(cluster)) {
+                Map<String, String> labels = container.getLabels();
+                if (!"running".equals(container.getState())) {
+                    lifecycleManager.getDockerClient().startContainerCmd(container.getId()).exec();
+                }
+                configureLinkLocalForwarding(cluster, container.getId());
+                if (!Boolean.parseBoolean(labels.get(WORKER_NODE_LABEL + ".registered"))) {
+                    continue;
+                }
+                String ip = lifecycleManager.resolveContainerNetworkIp(container.getId(), eksDockerNetwork());
+                registerWorkerInstance(cluster, workerInstance(cluster, labels.get(WORKER_NODE_LABEL),
+                        labels.get(WORKER_NODE_LABEL + ".zone"), labels.get(WORKER_NODE_LABEL + ".instance-type"),
+                        labels.get(WORKER_NODE_LABEL + ".subnet"), ip, container.getId()));
+            }
+        } catch (Exception e) {
+            LOG.warnv("Could not restore worker nodes of EKS cluster {0}: {1}", cluster.getName(), e.getMessage());
+        }
+    }
+
+    /** Removes every worker node Floci started for one node group. */
+    public void stopNodegroupWorkers(Cluster cluster, String nodegroupName) {
+        try {
+            for (var container : workerContainers(cluster)) {
+                if (nodegroupName.equals(container.getLabels().get(WORKER_NODE_LABEL + ".nodegroup"))) {
+                    stopWorkerNode(cluster, container.getLabels().get(WORKER_NODE_LABEL));
+                }
+            }
+        } catch (Exception e) {
+            LOG.warnv("Could not remove the workers of node group {0}: {1}", nodegroupName, e.getMessage());
+        }
+    }
+
+    /** Removes a worker node's container, its EC2 view and its Kubernetes Node. */
+    public void stopWorkerNode(Cluster cluster, String instanceId) {
+        clusterNodeInstances.remove(workerRecordKey(cluster, instanceId));
+        String name = workerContainerName(cluster, instanceId);
+        try {
+            lifecycleManager.removeIfExists(name);
+        } catch (Exception e) {
+            LOG.warnv("Could not remove worker node container {0}: {1}", name, e.getMessage());
+        }
+        if (cluster.getContainerId() != null) {
+            execInContainerForResult(cluster.getContainerId(), new String[]{"kubectl", "delete", "node",
+                    workerNodeName(instanceId, clusterRegion(cluster)), "--ignore-not-found", "--wait=false"}, 30);
+        }
+    }
+
+    /** Removes every worker node container that belongs to the cluster. */
+    void stopAllWorkerNodes(Cluster cluster) {
+        String prefix = cluster.getDockerName() + "-i-";
+        try {
+            for (var container : lifecycleManager.getDockerClient().listContainersCmd().withShowAll(true)
+                    .withLabelFilter(List.of(WORKER_NODE_LABEL)).exec()) {
+                for (String containerName : container.getNames()) {
+                    if (containerName.replaceFirst("^/", "").startsWith(prefix)) {
+                        lifecycleManager.removeIfExists(containerName.replaceFirst("^/", ""));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.warnv("Could not remove worker nodes of EKS cluster {0}: {1}", cluster.getName(), e.getMessage());
+        }
+        clusterNodeInstances.keySet().removeIf(key -> key.startsWith(clusterResourceName(cluster) + "/"));
+    }
+
+    private String workerRecordKey(Cluster cluster, String instanceId) {
+        return clusterResourceName(cluster) + "/" + instanceId;
+    }
+
+    static final String WORKER_NODE_LABEL = "floci.eks.worker-node";
+    static final String NODEGROUP_LABEL = "eks.amazonaws.com/nodegroup";
+
+    /** The CSI driver each storage add-on registers, which Floci stands in for with local volumes. */
+    static final Map<String, String> CSI_ADDON_DRIVERS = Map.of(
+            "aws-ebs-csi-driver", "ebs.csi.aws.com",
+            "aws-efs-csi-driver", "efs.csi.aws.com");
+
+    /**
+     * Installs a working stand-in for an add-on that EKS would run. The CSI drivers become k3s
+     * local-path provisioners under the driver's name, so claims on EBS or EFS classes bind.
+     */
+    public void installAddonStandIn(Cluster cluster, String addonName) {
+        String driver = CSI_ADDON_DRIVERS.get(addonName);
+        if (driver == null || cluster.getContainerId() == null) {
+            return;
+        }
+        ContainerExec.Result result = execInContainerForResult(cluster.getContainerId(),
+                new String[]{"sh", "-c", csiStandInScript(driver)}, 120);
+        if (result.exitCode() != 0) {
+            LOG.warnv("EKS cluster {0} gets no {1} volumes: {2}", cluster.getName(), driver, result.summary());
+            return;
+        }
+        LOG.infov("Installed a local-path stand-in for {0} on EKS cluster {1}", driver, cluster.getName());
+    }
+
+    /**
+     * Copies the bundled local-path provisioner under a new name. The copy reuses the bundled
+     * image, config and RBAC, and waits for k3s to deploy them first.
+     */
+    static String csiStandInScript(String driver) {
+        String name = "floci-" + driver.substring(0, driver.indexOf('.')) + "-csi";
+        return """
+                set -e
+                for i in $(seq 60); do
+                  kubectl -n kube-system get deploy local-path-provisioner >/dev/null 2>&1 && break
+                  sleep 2
+                done
+                IMG=$(kubectl -n kube-system get deploy local-path-provisioner -o jsonpath='{.spec.template.spec.containers[0].image}')
+                SA=$(kubectl -n kube-system get deploy local-path-provisioner -o jsonpath='{.spec.template.spec.serviceAccountName}')
+                kubectl -n kube-system get cm local-path-config -o jsonpath='{.data.config\\.json}' > /tmp/%1$s-config.json
+                kubectl -n kube-system get cm local-path-config -o jsonpath='{.data.setup}' > /tmp/%1$s-setup
+                kubectl -n kube-system get cm local-path-config -o jsonpath='{.data.teardown}' > /tmp/%1$s-teardown
+                kubectl -n kube-system get cm local-path-config -o jsonpath='{.data.helperPod\\.yaml}' > /tmp/%1$s-helperPod.yaml
+                kubectl -n kube-system create cm %1$s-config --from-file=config.json=/tmp/%1$s-config.json \
+                  --from-file=setup=/tmp/%1$s-setup --from-file=teardown=/tmp/%1$s-teardown \
+                  --from-file=helperPod.yaml=/tmp/%1$s-helperPod.yaml --dry-run=client -o yaml | kubectl apply -f -
+                cat <<EOF | kubectl apply -f -
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: %1$s
+                  namespace: kube-system
+                spec:
+                  replicas: 1
+                  selector:
+                    matchLabels: {app: %1$s}
+                  template:
+                    metadata:
+                      labels: {app: %1$s}
+                    spec:
+                      serviceAccountName: $SA
+                      priorityClassName: system-node-critical
+                      tolerations:
+                        - operator: Exists
+                      containers:
+                        - name: provisioner
+                          image: $IMG
+                          command: [local-path-provisioner, start, --config, /etc/config/config.json,
+                                    --provisioner-name, %2$s, --configmap-name, %1$s-config,
+                                    --service-account-name, $SA]
+                          env:
+                            - {name: POD_NAMESPACE, value: kube-system}
+                            - {name: CONFIG_MOUNT_PATH, value: /etc/config/}
+                          volumeMounts:
+                            - {name: config, mountPath: /etc/config/}
+                      volumes:
+                        - name: config
+                          configMap: {name: %1$s-config}
+                EOF
+                """.formatted(name, driver);
+    }
+
+    private static final java.util.regex.Pattern NODE_CONFIG_CLUSTER = java.util.regex.Pattern.compile(
+            "(?m)^\\s*cluster:\\s*\\n(?:\\s+\\S.*\\n)*?\\s+name:\\s*['\"]?([\\w.-]+)");
+    private static final java.util.regex.Pattern NODE_LABELS_FLAG = java.util.regex.Pattern.compile(
+            "--node-labels=['\"]?([^'\"\\s]+)");
+    private static final java.util.regex.Pattern NODE_TAINTS_FLAG = java.util.regex.Pattern.compile(
+            "--register-with-taints=['\"]?([^'\"\\s]+)");
+
+    /** What a nodeadm NodeConfig in user data asks of the node. */
+    record NodeConfigRequest(String clusterName, Map<String, String> labels, List<String> taints) {}
+
+    /** Reads the cluster name, labels and taints from nodeadm user data, or null when it has none. */
+    static NodeConfigRequest parseNodeConfig(String userData) {
+        if (userData == null || !userData.contains("NodeConfig")) {
+            return null;
+        }
+        java.util.regex.Matcher cluster = NODE_CONFIG_CLUSTER.matcher(userData);
+        if (!cluster.find()) {
+            return null;
+        }
+        Map<String, String> labels = new LinkedHashMap<>();
+        java.util.regex.Matcher labelFlag = NODE_LABELS_FLAG.matcher(userData);
+        while (labelFlag.find()) {
+            for (String pair : labelFlag.group(1).split(",")) {
+                int eq = pair.indexOf('=');
+                if (eq > 0) {
+                    labels.put(pair.substring(0, eq), pair.substring(eq + 1));
+                }
+            }
+        }
+        List<String> taints = new ArrayList<>();
+        java.util.regex.Matcher taintFlag = NODE_TAINTS_FLAG.matcher(userData);
+        while (taintFlag.find()) {
+            taints.addAll(List.of(taintFlag.group(1).split(",")));
+        }
+        return new NodeConfigRequest(cluster.group(1), labels, taints);
+    }
+
+    @Override
+    public boolean launchWorkerNode(Instance instance, String region) {
+        if (!workerNodesEnabled()) {
+            return false;
+        }
+        String userData = instance.getUserData();
+        if ((userData == null || !userData.contains("NodeConfig")) && instance.getEncodedUserData() != null) {
+            try {
+                userData = new String(Base64.getDecoder().decode(instance.getEncodedUserData()), StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException e) {
+                return false;
+            }
+        }
+        NodeConfigRequest request = parseNodeConfig(userData);
+        if (request == null) {
+            return false;
+        }
+        Cluster cluster = activeClusters.values().stream()
+                .filter(c -> request.clusterName().equals(c.getName()))
+                .filter(c -> region == null || region.equals(clusterRegion(c)))
+                .findFirst().orElse(null);
+        if (cluster == null) {
+            LOG.warnv("Instance {0} names EKS cluster {1}, which is not running here; launching it as a plain instance",
+                    instance.getInstanceId(), request.clusterName());
+            return false;
+        }
+        String az = instance.getPlacement() != null ? instance.getPlacement().getAvailabilityZone() : region + "a";
+        WorkerNodeSpec spec = new WorkerNodeSpec(instance.getInstanceId(), az, instance.getInstanceType(),
+                instance.getSubnetId(), request.labels(), request.taints());
+        java.util.concurrent.CompletableFuture.runAsync(() -> {
+            try {
+                Instance node = startWorkerNode(cluster, spec, false);
+                synchronized (instance) {
+                    instance.setDockerContainerId(node.getDockerContainerId());
+                    instance.setState(InstanceState.running());
+                }
+            } catch (RuntimeException e) {
+                LOG.warnv("Instance {0} could not join EKS cluster {1}: {2}",
+                        instance.getInstanceId(), cluster.getName(), e.getMessage());
+                synchronized (instance) {
+                    instance.setState(InstanceState.terminated());
+                    instance.setTerminatedAt(System.currentTimeMillis());
+                }
+            }
+        });
+        return true;
     }
 
     record ContainerIps(String primaryIp, Set<String> allIps) {}

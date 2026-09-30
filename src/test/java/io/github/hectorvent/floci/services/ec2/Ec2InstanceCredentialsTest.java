@@ -106,6 +106,23 @@ class Ec2InstanceCredentialsTest {
         }
     }
 
+    @Test
+    void registerAdoptsCredentialsFromThePreviousServer() {
+        Fixture fixture = fixture();
+        SessionCredential stored = new SessionCredential("ASIASTORED", "secret", "token",
+                fixture.role.getArn(), NOW.plusSeconds(1800), null, ACCOUNT);
+        stored.setEc2InstanceId("i-restored");
+        stored.setEc2RoleId(fixture.role.getRoleId());
+        when(fixture.iam.findEc2InstanceSessions("i-restored")).thenReturn(List.of(stored));
+        Instance restored = new Instance();
+        restored.setInstanceId("i-restored");
+        restored.setIamInstanceProfileArn(PROFILE);
+        fixture.credentials.register(restored);
+        assertSame(stored, fixture.credentials.get(restored, "worker", NOW).orElseThrow());
+        fixture.credentials.unregister(restored);
+        verify(fixture.iam).unregisterSession(ACCOUNT, "ASIASTORED");
+    }
+
     private static Fixture fixture() {
         IamService iam = mock(IamService.class);
         InstanceProfile profile = new InstanceProfile();

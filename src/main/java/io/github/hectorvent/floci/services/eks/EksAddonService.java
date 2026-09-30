@@ -51,6 +51,9 @@ public class EksAddonService {
     private final EksPodIdentityAssociationService podIdentityAssociations;
 
     @Inject
+    EksClusterManager clusterManager;
+
+    @Inject
     public EksAddonService(StorageFactory storageFactory, EksAddonCatalog catalog,
                            IamService iam, EksPodIdentityAssociationService podIdentityAssociations) {
         this(storageFactory.create("eks", "eks-addons.json",
@@ -157,6 +160,9 @@ public class EksAddonService {
 
         storage.put(storageKey, new StoredAddon(addon, request.clientRequestToken()));
         LOG.infov("Created EKS addon {0} on cluster {1} with version {2}", addonName, cluster.getName(), version);
+        if (clusterManager != null && clusterManager.workerNodesEnabled()) {
+            clusterManager.installAddonStandIn(cluster, addonName);
+        }
         return addon;
     }
 

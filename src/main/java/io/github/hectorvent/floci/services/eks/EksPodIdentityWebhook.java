@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.ContainerCaBundle;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -41,6 +42,7 @@ public class EksPodIdentityWebhook {
     static final String POD_IDENTITY_ADDON = "eks-pod-identity-agent";
 
     static final String TOKEN_VOLUME_NAME = "eks-pod-identity-token";
+    static final String CA_BUNDLE_VOLUME_NAME = "floci-ca-bundle";
     static final String TOKEN_AUDIENCE = "pods.eks.amazonaws.com"; // partition-literal: pod-identity token audience; no source outside the commercial partition (P9)
     static final String TOKEN_MOUNT_PATH = "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount"; // partition-literal: the projected-token mount path the EKS agent hardcodes
     static final String TOKEN_FILE_NAME = "eks-pod-identity-token";
@@ -58,6 +60,9 @@ public class EksPodIdentityWebhook {
     private final EksService eks;
     private final EksAddonService addons;
     private final EksPodIdentityAssociationService associations;
+
+    @Inject
+    EksClusterManager clusterManager;
 
     @Inject
     public EksPodIdentityWebhook(EksService eks, EksAddonService addons,
@@ -78,7 +83,8 @@ public class EksPodIdentityWebhook {
         Map<String, Object> request = admissionReview == null ? null : asMap(admissionReview.get("request"));
         String uid = request != null && request.get("uid") instanceof String value ? value : "";
         try {
-            return admissionReview(apiVersion, uid, decide(clusterName, accountId, request));
+            return admissionReview(apiVersion, uid, io.github.hectorvent.floci.core.common.RequestScopes.callAs(
+                    accountId, () -> decide(clusterName, accountId, request)));
         } catch (RuntimeException e) {
             LOG.warnv("EKS pod-identity-webhook: admitting pod unchanged for cluster {0} after an "
                     + "internal error: {1}", clusterName, e.toString());
@@ -106,7 +112,8 @@ public class EksPodIdentityWebhook {
         if (!hasAssociation(cluster.get(), namespace, serviceAccountOf(pod))) {
             return List.of();
         }
-        return buildPatch(pod);
+        List<Map<String, Object>> env = awsEnvironment(cluster.get());
+        return buildPatch(pod, env, !env.isEmpty());
     }
 
     private boolean podIdentityAgentInstalled(Cluster cluster) {
@@ -137,23 +144,70 @@ public class EksPodIdentityWebhook {
      * never overrides a value the workload set itself.
      */
     static List<Map<String, Object>> buildPatch(Map<String, Object> pod) {
+        return buildPatch(pod, List.of(), false);
+    }
+
+    /**
+     * The region and endpoint variables that point the pod's AWS SDK at Floci. They are empty
+     * unless worker nodes are on, because only then does Floci know an address pods can reach.
+     */
+    private List<Map<String, Object>> awsEnvironment(Cluster cluster) {
+        if (clusterManager == null || !clusterManager.workerNodesEnabled()) {
+            return List.of();
+        }
+        List<Map<String, Object>> env = new ArrayList<>();
+        String region = clusterManager.clusterRegion(cluster);
+        env.add(Map.of("name", "AWS_REGION", "value", region));
+        env.add(Map.of("name", "AWS_DEFAULT_REGION", "value", region));
+        clusterManager.flociClusterEndpoint()
+                .ifPresent(endpoint -> env.add(Map.of("name", "AWS_ENDPOINT_URL", "value", endpoint)));
+        // SDKs that ignore AWS_ENDPOINT_URL reach Floci through amazonaws.com, so they must trust its CA.
+        env.add(Map.of("name", "AWS_CA_BUNDLE", "value", ContainerCaBundle.CONTAINER_PATH));
+        return env;
+    }
+
+    /** With {@code caBundle}, also mounts the node's Floci CA bundle, which every Floci node carries. */
+    static List<Map<String, Object>> buildPatch(Map<String, Object> pod, List<Map<String, Object>> extraEnv,
+                                                boolean caBundle) {
         Map<String, Object> spec = asMap(pod.get("spec"));
         if (spec == null) {
             return List.of();
         }
         List<Map<String, Object>> patch = new ArrayList<>();
-        List<Object> volumes = asList(spec.get("volumes"));
-        if (volumes == null) {
-            patch.add(operation("/spec/volumes", List.of(tokenVolume())));
-        } else if (!containsNamed(volumes, TOKEN_VOLUME_NAME)) {
-            patch.add(operation("/spec/volumes/-", tokenVolume()));
+        List<Map<String, Object>> wantedVolumes = new ArrayList<>(List.of(tokenVolume()));
+        List<Map<String, Object>> wantedMounts = new ArrayList<>(List.of(tokenMount()));
+        if (caBundle) {
+            wantedVolumes.add(Map.of("name", CA_BUNDLE_VOLUME_NAME, "hostPath",
+                    Map.of("path", ContainerCaBundle.CONTAINER_PATH, "type", "File")));
+            wantedMounts.add(Map.of("name", CA_BUNDLE_VOLUME_NAME, "mountPath", ContainerCaBundle.CONTAINER_PATH,
+                    "readOnly", true));
         }
-        patchContainers(patch, spec, "initContainers");
-        patchContainers(patch, spec, "containers");
+        addMissingNamed(patch, "/spec/volumes", asList(spec.get("volumes")), wantedVolumes);
+        patchContainers(patch, spec, "initContainers", extraEnv, wantedMounts);
+        patchContainers(patch, spec, "containers", extraEnv, wantedMounts);
         return patch;
     }
 
-    private static void patchContainers(List<Map<String, Object>> patch, Map<String, Object> spec, String field) {
+    /** Appends each wanted entry whose name the list lacks, creating the list when it is absent. */
+    private static void addMissingNamed(List<Map<String, Object>> patch, String path, List<Object> existing,
+                                        List<Map<String, Object>> wanted) {
+        List<Map<String, Object>> missing = wanted.stream()
+                .filter(entry -> existing == null || !containsNamed(existing, String.valueOf(entry.get("name"))))
+                .toList();
+        if (missing.isEmpty()) {
+            return;
+        }
+        if (existing == null) {
+            patch.add(operation(path, missing));
+            return;
+        }
+        for (Map<String, Object> entry : missing) {
+            patch.add(operation(path + "/-", entry));
+        }
+    }
+
+    private static void patchContainers(List<Map<String, Object>> patch, Map<String, Object> spec, String field,
+                                        List<Map<String, Object>> extraEnv, List<Map<String, Object>> wantedMounts) {
         List<Object> containers = asList(spec.get(field));
         if (containers == null) {
             return;
@@ -164,29 +218,10 @@ public class EksPodIdentityWebhook {
                 continue;
             }
             String path = "/spec/" + field + "/" + index;
-            List<Object> mounts = asList(container.get("volumeMounts"));
-            if (mounts == null) {
-                patch.add(operation(path + "/volumeMounts", List.of(tokenMount())));
-            } else if (!containsNamed(mounts, TOKEN_VOLUME_NAME)) {
-                patch.add(operation(path + "/volumeMounts/-", tokenMount()));
-            }
-            List<Object> env = asList(container.get("env"));
-            List<Map<String, Object>> missing = new ArrayList<>();
-            for (Map<String, Object> variable : credentialsEnv()) {
-                if (env == null || !containsNamed(env, String.valueOf(variable.get("name")))) {
-                    missing.add(variable);
-                }
-            }
-            if (missing.isEmpty()) {
-                continue;
-            }
-            if (env == null) {
-                patch.add(operation(path + "/env", missing));
-            } else {
-                for (Map<String, Object> variable : missing) {
-                    patch.add(operation(path + "/env/-", variable));
-                }
-            }
+            addMissingNamed(patch, path + "/volumeMounts", asList(container.get("volumeMounts")), wantedMounts);
+            List<Map<String, Object>> wantedEnv = new ArrayList<>(credentialsEnv());
+            wantedEnv.addAll(extraEnv);
+            addMissingNamed(patch, path + "/env", asList(container.get("env")), wantedEnv);
         }
     }
 

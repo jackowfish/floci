@@ -61,22 +61,22 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
+import java.util.Comparator;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.Collection;
-import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -121,6 +121,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static final int MAX_OIDC_THUMBPRINTS = 5;
     private static final int MAX_OIDC_URL_LENGTH = 255;
     private static final String ACCOUNT_PASSWORD_POLICY_KEY = "account-password-policy";
+    private static final String OUTBOUND_WEB_IDENTITY_KEY = "outbound-web-identity-issuer";
     /** AWS-documented bounds for the account password policy's numeric fields. */
     private static final int MIN_PASSWORD_LENGTH_FLOOR = 6;
     private static final int MIN_PASSWORD_LENGTH_CEILING = 128;
@@ -331,6 +332,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * device would otherwise both see it unassigned and the second would silently steal it.
      */
     private final Object mfaDeviceLock = new Object();
+    /** Holds the account's outbound web identity issuer URL while the feature is enabled. */
+    private StorageBackend<String, String> outboundWebIdentityIssuers = new InMemoryStorage<>();
     private final RegionResolver regionResolver;
     private final boolean seedDeployerPrincipal;
     private final String seededAccountAlias;
@@ -372,6 +375,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             config.services().iam().seedDeployerPrincipal(),
             config.services().iam().accountAlias().orElse(null)
         );
+        this.outboundWebIdentityIssuers =
+                storageFactory.create("iam", "iam-outbound-web-identity.json", new TypeReference<>() {});
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -2056,6 +2061,33 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                             + "characters and maximum length of 63 characters, contain only digits, lowercase "
                             + "letters, and hyphens (-), but cannot begin or end with a hyphen.", 400);
         }
+    }
+
+    // =========================================================================
+    // Outbound Web Identity Federation
+    // =========================================================================
+
+    public Optional<String> getOutboundWebIdentityIssuer() {
+        return outboundWebIdentityIssuers.get(OUTBOUND_WEB_IDENTITY_KEY);
+    }
+
+    /** AWS gives each account a random issuer on its own tokens domain, and rejects a second enable. */
+    public String enableOutboundWebIdentityFederation() {
+        if (getOutboundWebIdentityIssuer().isPresent()) {
+            throw new AwsException("FeatureEnabled",
+                    "Outbound web identity federation is already enabled for this account.", 409);
+        }
+        String issuer = "https://" + UUID.randomUUID() + ".tokens.sts.global.api.aws";
+        outboundWebIdentityIssuers.put(OUTBOUND_WEB_IDENTITY_KEY, issuer);
+        return issuer;
+    }
+
+    public void disableOutboundWebIdentityFederation() {
+        if (getOutboundWebIdentityIssuer().isEmpty()) {
+            throw new AwsException("FeatureDisabled",
+                    "Outbound web identity federation is not enabled for this account.", 409);
+        }
+        outboundWebIdentityIssuers.delete(OUTBOUND_WEB_IDENTITY_KEY);
     }
 
     // =========================================================================
@@ -3839,18 +3871,30 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
     }
 
-    /** IMDS registrations are rebuilt on startup; discard credentials from the previous server. */
+    /** Removes expired IMDS credentials; live ones stay valid for guests that cached them before a restart. */
     public int sweepOrphanedEc2InstanceSessions() {
-        List<SessionCredential> stored = sessions instanceof AccountAwareStorageBackend<SessionCredential> aware
-                ? aware.scanAllAccounts() : sessions.scan(key -> true);
+        Instant now = Instant.now();
         int removed = 0;
-        for (SessionCredential session : stored) {
-            if (session.getEc2InstanceId() != null) {
+        for (SessionCredential session : allSessions()) {
+            if (session.getEc2InstanceId() != null && !session.getExpiration().isAfter(now)) {
                 deleteSession(session.getAccessKeyId(), session);
                 removed++;
             }
         }
         return removed;
+    }
+
+    /** Returns the stored IMDS credentials of one instance, oldest expiration first. */
+    public List<SessionCredential> findEc2InstanceSessions(String instanceId) {
+        return allSessions().stream()
+                .filter(session -> instanceId.equals(session.getEc2InstanceId()))
+                .sorted(Comparator.comparing(SessionCredential::getExpiration))
+                .toList();
+    }
+
+    private List<SessionCredential> allSessions() {
+        return sessions instanceof AccountAwareStorageBackend<SessionCredential> aware
+                ? aware.scanAllAccounts() : sessions.scan(key -> true);
     }
 
     /** Registers an ECS task-role session, outside request scope. */

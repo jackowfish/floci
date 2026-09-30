@@ -63,7 +63,18 @@ public class ServiceQuotasService {
                     new QuotaDefinition("L-E619E033", "Maximum number of accounts", 50.0, true)),
             // AWS default values: tooling such as Terraform's aws_servicequotas_service_quota
             // compares its desired value against these before requesting an increase.
+            "ec2", List.of(
+                    new QuotaDefinition("L-1216C47A", "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances", 1152.0, true),
+                    new QuotaDefinition("L-DB2E81BA", "Running On-Demand G and VT instances", 64.0, true),
+                    new QuotaDefinition("L-417A185B", "Running On-Demand P instances", 64.0, true),
+                    new QuotaDefinition("L-7295265B", "Running On-Demand X instances", 64.0, true),
+                    new QuotaDefinition("L-34B43A08", "All Standard (A, C, D, H, I, M, R, T, Z) Spot Instance Requests", 1152.0, true),
+                    new QuotaDefinition("L-3819A6DF", "All G and VT Spot Instance Requests", 64.0, true),
+                    new QuotaDefinition("L-7212CCBC", "All P Spot Instance Requests", 64.0, true),
+                    new QuotaDefinition("L-E3A00192", "All X Spot Instance Requests", 64.0, true),
+                    new QuotaDefinition("L-0263D0A3", "EC2-VPC Elastic IPs", 5.0, true)),
             "vpc", List.of(
+                    new QuotaDefinition("L-F678F1CE", "VPCs per Region", 5.0, true),
                     new QuotaDefinition("L-FE5A380F", "NAT gateways per Availability Zone", 5.0, false),
                     new QuotaDefinition("L-2AEEBF1A", "Rules per network ACL", 20.0, false)));
 

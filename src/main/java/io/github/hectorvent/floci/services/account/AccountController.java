@@ -3,7 +3,10 @@ package io.github.hectorvent.floci.services.account;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.JsonErrorResponseUtils;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.services.account.model.AlternateContact;
@@ -15,6 +18,9 @@ import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+
+import java.util.HashSet;
+import java.util.Set;
 
 @Path("/")
 @Produces(MediaType.APPLICATION_JSON)
@@ -44,6 +50,24 @@ public class AccountController {
         AlternateContact contact = accountService.getAlternateContact(requestContext.getAccountId(), readTree(body));
         ObjectNode response = objectMapper.createObjectNode();
         response.set("AlternateContact", objectMapper.valueToTree(contact));
+        return Response.ok(response).build();
+    }
+
+    // Floci serves every region, but opt-in regions report DISABLED as they do in a fresh account.
+    @POST
+    @Path("/listRegions")
+    public Response listRegions(String body) {
+        Set<String> wanted = new HashSet<>();
+        readTree(body).path("RegionOptStatusContains").forEach(status -> wanted.add(status.asText()));
+        ArrayNode regions = objectMapper.createArrayNode();
+        for (AwsPartition.Region region : AwsPartitions.forRegionOrCommercial(requestContext.getRegion()).regions()) {
+            String status = region.optIn() ? "DISABLED" : "ENABLED_BY_DEFAULT";
+            if (wanted.isEmpty() || wanted.contains(status)) {
+                regions.addObject().put("RegionName", region.id()).put("RegionOptStatus", status);
+            }
+        }
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("Regions", regions);
         return Response.ok(response).build();
     }
 
