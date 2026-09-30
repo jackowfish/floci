@@ -4087,8 +4087,32 @@ public class Ec2QueryHandler {
 
     // ─── Region / AZ / Account handlers ──────────────────────────────────────
 
+    /** Applies ZoneName.N, ZoneId.N and the zone-name, zone-id and state filters. */
+    private static boolean matchesZoneSelectors(MultivaluedMap<String, String> p, Map<String, String> az) {
+        Map<String, List<String>> wanted = new java.util.LinkedHashMap<>();
+        for (String[] selector : new String[][] {{"ZoneName", "zoneName"}, {"ZoneId", "zoneId"}}) {
+            for (int i = 1; p.getFirst(selector[0] + "." + i) != null; i++) {
+                wanted.computeIfAbsent(selector[1], k -> new ArrayList<>()).add(p.getFirst(selector[0] + "." + i));
+            }
+        }
+        Map<String, String> filterKeys = Map.of("zone-name", "zoneName", "zone-id", "zoneId", "state", "state",
+                "region-name", "regionName");
+        for (int i = 1; p.getFirst("Filter." + i + ".Name") != null; i++) {
+            String key = filterKeys.get(p.getFirst("Filter." + i + ".Name"));
+            if (key == null) {
+                continue;
+            }
+            for (int j = 1; p.getFirst("Filter." + i + ".Value." + j) != null; j++) {
+                wanted.computeIfAbsent(key, k -> new ArrayList<>()).add(p.getFirst("Filter." + i + ".Value." + j));
+            }
+        }
+        return wanted.entrySet().stream().allMatch(e -> e.getValue().contains(az.get(e.getKey())));
+    }
+
     private Response handleDescribeAvailabilityZones(MultivaluedMap<String, String> p, String region) {
-        List<Map<String, String>> zones = service.describeAvailabilityZones(region);
+        List<Map<String, String>> zones = service.describeAvailabilityZones(region).stream()
+                .filter(az -> matchesZoneSelectors(p, az))
+                .toList();
         XmlBuilder xml = new XmlBuilder()
                 .start("DescribeAvailabilityZonesResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())

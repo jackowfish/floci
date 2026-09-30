@@ -85,6 +85,7 @@ public class EmbeddedDnsServer {
     // the packet path rather than at startup, where a source's storage must not be touched yet.
     private final Iterable<DnsRecordSource> recordSources;
     private final Iterable<DnsForwardingRuleSource> forwardingRuleSources;
+    private Iterable<DnsClientRecordSource> clientRecordSources = List.of();
     private final Iterable<DnsClientVpcSource> clientVpcSources;
 
     EmbeddedDnsServer(List<String> suffixes) {
@@ -109,7 +110,9 @@ public class EmbeddedDnsServer {
     public EmbeddedDnsServer(EmulatorConfig config, ContainerDetector containerDetector, Vertx vertx,
                              Instance<DnsRecordSource> recordSources,
                              Instance<DnsForwardingRuleSource> forwardingRuleSources,
-                             Instance<DnsClientVpcSource> clientVpcSources) {
+                             Instance<DnsClientVpcSource> clientVpcSources,
+                             Instance<DnsClientRecordSource> clientRecordSources) {
+        this.clientRecordSources = clientRecordSources;
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
@@ -256,6 +259,10 @@ public class EmbeddedDnsServer {
         if (emulatorName.isPresent()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
         }
+        Optional<DnsAnswer> clientAnswer = resolveForClient(name, type, clientAddress);
+        if (clientAnswer.isPresent()) {
+            return QueryPlan.answering(clientAnswer.orElseThrow());
+        }
         // A rule steers the name whatever the query asks about it, so this is deliberately not
         // gated on the record type: the raw query is relayed to the rule's resolvers as it stands.
         Optional<DnsForwardingRule> rule = matchingRule(name, clientAddress);
@@ -342,6 +349,24 @@ public class EmbeddedDnsServer {
      * today. A source that throws must not take the DNS server down with it: the query falls
      * through to the upstream resolvers, which is what happened before any source existed.
      */
+    private Optional<DnsAnswer> resolveForClient(String name, int type, String clientAddress) {
+        if (clientRecordSources == null || name == null || clientAddress == null) {
+            return Optional.empty();
+        }
+        for (DnsClientRecordSource source : clientRecordSources) {
+            try {
+                Optional<DnsAnswer> answer = source.resolve(name, type, clientAddress.trim());
+                if (answer != null && answer.isPresent()) {
+                    return answer;
+                }
+            } catch (Exception e) {
+                LOG.debugv("DNS client record source {0} failed to resolve {1}: {2}",
+                        source.getClass().getSimpleName(), name, e.getMessage());
+            }
+        }
+        return Optional.empty();
+    }
+
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type) {
         if (recordSources == null) {
             return Optional.empty();

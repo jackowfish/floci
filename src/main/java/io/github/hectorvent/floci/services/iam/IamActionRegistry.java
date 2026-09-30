@@ -111,7 +111,7 @@ public class IamActionRegistry {
         if (isQueryRequest(ctx)) {
             String queryAction = queryAction(ctx);
             if (queryAction != null && !queryAction.isBlank()) {
-                return credentialScope + ":" + queryAction;
+                return iamPrefix(credentialScope) + ":" + queryAction;
             }
         }
 
@@ -119,7 +119,7 @@ public class IamActionRegistry {
         String target = ctx.getHeaderString("X-Amz-Target");
         if (target != null && target.contains(".")) {
             String operationName = target.substring(target.lastIndexOf('.') + 1);
-            return credentialScope + ":" + operationName;
+            return iamPrefix(credentialScope) + ":" + operationName;
         }
 
         // REST-JSON: match against rule table
@@ -283,4 +283,13 @@ public class IamActionRegistry {
         return null;
     }
 
+
+    public static String iamPrefix(String signingName) {
+        return switch (signingName) {
+            case "tagging" -> "tag";
+            case "monitoring" -> "cloudwatch";
+            case "email" -> "ses";
+            default -> signingName;
+        };
+    }
 }

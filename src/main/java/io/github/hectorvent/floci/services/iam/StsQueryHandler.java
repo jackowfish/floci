@@ -160,9 +160,12 @@ public class StsQueryHandler {
             return null;
         }
         String auth = headers == null ? null : headers.getHeaderString("Authorization");
-        String callerAccount = accountResolver.resolve(auth);
-        String callerArn = iamService.resolveCallerArn(
-                        auth == null ? null : accountResolver.extractAccessKeyId(auth))
+        Optional<String> resolvedArn = iamService.resolveCallerArn(
+                auth == null ? null : accountResolver.extractAccessKeyId(auth));
+        // An IAM access key belongs to its user's account, not the default account.
+        String callerAccount = resolvedArn.map(a -> a.split(":")[4]).filter(a -> a.matches("\\d{12}"))
+                .orElse(accountResolver.resolve(auth));
+        String callerArn = resolvedArn
                 .orElse(AwsArnUtils.Arn.of("iam", "", callerAccount, "root").toString());
         if (trustPolicyEvaluator.allows(role.get().getAssumeRolePolicyDocument(), callerArn, callerAccount)) {
             return null;

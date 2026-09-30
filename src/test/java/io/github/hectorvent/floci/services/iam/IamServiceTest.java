@@ -83,8 +83,10 @@ class IamServiceTest {
         assertTrue(iamService.findSecretKey(session.getAccessKeyId(), null).isEmpty());
         iamService.registerSession("ASIAOTHER", "other-secret", "other-token", session.getRoleArn(),
                 Instant.now().plusSeconds(3600), null);
-        assertEquals(1, iamService.sweepOrphanedEc2InstanceSessions());
-        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), "token").isEmpty());
+        assertEquals(0, iamService.sweepOrphanedEc2InstanceSessions());
+        assertTrue(iamService.findSecretKey(session.getAccessKeyId(), "token").isPresent());
+        assertEquals(List.of(session.getAccessKeyId()), iamService.findEc2InstanceSessions("i-worker").stream()
+                .map(SessionCredential::getAccessKeyId).toList());
         assertTrue(iamService.findSecretKey("ASIAOTHER", "other-token").isPresent());
     }
 

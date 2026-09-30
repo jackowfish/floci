@@ -14,6 +14,7 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -59,8 +60,128 @@ public class ResourceArnBuilder {
             case "secretsmanager" -> List.of(buildSecretsManagerArn(ctx, region, accountId));
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "kms"            -> List.of(buildKmsArn(path, region, accountId));
+            case "iam"            -> List.of(buildIamArn(ctx, region, accountId));
+            case "ec2"            -> List.of(buildEc2Arn(ctx, region, accountId));
+            case "events"         -> List.of(buildEventsRuleArn(ctx, region, accountId));
+            case "eks"            -> List.of(buildEksArn(path, region, accountId));
             default               -> List.of("*");
         };
+    }
+
+    // ── IAM ─────────────────────────────────────────────────────────────────────
+    // IAM policies usually scope write actions to role or user name patterns.
+    private String buildIamArn(ContainerRequestContext ctx, String region, String accountId) {
+        String partition = AwsRegions.partitionFor(region);
+        // A call that names an instance profile or group acts on it, even when it also names a
+        // role or user. Attach*Policy acts on the principal, so PolicyArn comes last.
+        String[][] named = {{"InstanceProfileName", "instance-profile/"}, {"GroupName", "group/"},
+                {"RoleName", "role/"}, {"UserName", "user/"}};
+        for (String[] n : named) {
+            String name = RequestBodyReader.formField(ctx, n[0]);
+            if (name != null && !name.isEmpty()) {
+                return AwsArnUtils.Arn.global(partition, "iam", accountId, n[1] + name).toString();
+            }
+        }
+        for (String param : new String[] {"PolicyArn", "OpenIDConnectProviderArn"}) {
+            String arn = RequestBodyReader.formField(ctx, param);
+            if (arn != null && !arn.isEmpty()) return arn;
+        }
+        return "*";
+    }
+
+    // ── EC2 ─────────────────────────────────────────────────────────────────────
+    // Scoped EC2 policies name a resource type, such as launch-template/* or instance/*.
+
+    private static final Map<String, String> EC2_ACTION_RESOURCE_TYPES = Map.ofEntries(
+            Map.entry("CreateLaunchTemplate", "launch-template"),
+            Map.entry("CreateLaunchTemplateVersion", "launch-template"),
+            Map.entry("ModifyLaunchTemplate", "launch-template"),
+            Map.entry("DeleteLaunchTemplate", "launch-template"),
+            Map.entry("CreateFleet", "fleet"),
+            Map.entry("RunInstances", "instance"),
+            Map.entry("TerminateInstances", "instance"),
+            Map.entry("StartInstances", "instance"),
+            Map.entry("StopInstances", "instance"),
+            Map.entry("RebootInstances", "instance"),
+            Map.entry("CreateVolume", "volume"),
+            Map.entry("DeleteVolume", "volume"),
+            Map.entry("AttachVolume", "volume"),
+            Map.entry("DetachVolume", "volume"),
+            Map.entry("ModifyVolume", "volume"),
+            Map.entry("CreateSnapshot", "snapshot"),
+            Map.entry("DeleteSnapshot", "snapshot"));
+
+    private static final Map<String, String> EC2_ID_PREFIX_RESOURCE_TYPES = Map.ofEntries(
+            Map.entry("i-", "instance"),
+            Map.entry("lt-", "launch-template"),
+            Map.entry("fleet-", "fleet"),
+            Map.entry("vol-", "volume"),
+            Map.entry("snap-", "snapshot"),
+            Map.entry("sg-", "security-group"),
+            Map.entry("subnet-", "subnet"),
+            Map.entry("vpc-", "vpc"),
+            Map.entry("eni-", "network-interface"),
+            Map.entry("rtb-", "route-table"),
+            Map.entry("igw-", "internet-gateway"),
+            Map.entry("nat-", "natgateway"),
+            Map.entry("eipalloc-", "elastic-ip"));
+
+    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = RequestBodyReader.formField(ctx, "Action");
+        if (action == null) {
+            return "*";
+        }
+        String type = EC2_ACTION_RESOURCE_TYPES.get(action);
+        boolean tagging = "CreateTags".equals(action) || "DeleteTags".equals(action);
+        String id = tagging ? RequestBodyReader.formField(ctx, "ResourceId.1")
+                : firstNonEmpty(ctx, "InstanceId.1", "LaunchTemplateId", "VolumeId", "SnapshotId");
+        if (type == null && tagging && id != null) {
+            type = EC2_ID_PREFIX_RESOURCE_TYPES.entrySet().stream()
+                    .filter(e -> id.startsWith(e.getKey())).map(Map.Entry::getValue).findFirst().orElse(null);
+        }
+        if (type == null) {
+            return "*";
+        }
+        String name = id == null || id.isEmpty() || action.startsWith("Create") && !tagging ? "*" : id;
+        return AwsArnUtils.Arn.of("ec2", region, accountId, type + "/" + name).toString();
+    }
+
+    private static String firstNonEmpty(ContainerRequestContext ctx, String... keys) {
+        for (String key : keys) {
+            String value = RequestBodyReader.formField(ctx, key);
+            if (value != null && !value.isEmpty()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    // ── EventBridge ─────────────────────────────────────────────────────────────
+
+    private String buildEventsRuleArn(ContainerRequestContext ctx, String region, String accountId) {
+        JsonNode json = readJsonBody(ctx);
+        if (json == null || !json.isObject()) {
+            return "*";
+        }
+        String rule = json.hasNonNull("Rule") ? json.get("Rule").asText()
+                : json.hasNonNull("Name") ? json.get("Name").asText() : null;
+        if (rule == null || rule.isBlank()) {
+            return "*";
+        }
+        String bus = json.hasNonNull("EventBusName") ? json.get("EventBusName").asText() : "default";
+        String resource = "default".equals(bus) ? "rule/" + rule : "rule/" + bus + "/" + rule;
+        return AwsArnUtils.Arn.of("events", region, accountId, resource).toString();
+    }
+
+    // ── EKS ─────────────────────────────────────────────────────────────────────
+
+    private String buildEksArn(String path, String region, String accountId) {
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        String[] parts = stripped.split("/");
+        if (parts.length < 2 || !"clusters".equals(parts[0]) || parts[1].isEmpty()) {
+            return "*";
+        }
+        return AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + parts[1]).toString();
     }
 
     // ── S3 ──────────────────────────────────────────────────────────────────────

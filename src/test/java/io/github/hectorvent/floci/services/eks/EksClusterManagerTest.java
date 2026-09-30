@@ -143,7 +143,7 @@ class EksClusterManagerTest {
 
     @Test
     void networkModeReturnsContainerDnsOnlyInContainer() {
-        assertEquals("https://floci-eks-demo:6443",
+        assertEquals("https://floci-eks-demo:443",
                 EksClusterManager.resolvePublicEndpoint(true, "network", "floci-eks-demo", 6500));
         // Native mode has no usable container DNS name — falls back to the host endpoint.
         assertEquals("https://localhost:6500",
@@ -152,7 +152,7 @@ class EksClusterManagerTest {
 
     @Test
     void endpointModeIsCaseInsensitiveAndDefaultsToHost() {
-        assertEquals("https://floci-eks-demo:6443",
+        assertEquals("https://floci-eks-demo:443",
                 EksClusterManager.resolvePublicEndpoint(true, "NETWORK", "floci-eks-demo", 6500));
         // Unknown / unset modes behave as host.
         assertEquals("https://localhost:6500",
@@ -355,6 +355,9 @@ class EksClusterManagerTest {
         } else {
             verify(builder, never()).withEmbeddedDns();
         }
+        ArgumentCaptor<List<String>> cmd = ArgumentCaptor.captor();
+        verify(builder).withCmd(cmd.capture());
+        assertEquals(embeddedDns, cmd.getValue().contains(EksClusterManager.RESOLV_CONF_ARG));
     }
 
     /** Re-latching persisted clusters after a Floci/Docker restart (#2609), without a Docker daemon. */
@@ -439,8 +442,8 @@ class EksClusterManagerTest {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(survivingContainer("cid-1")));
             // adopt() starts a stopped container — the Docker-reboot case from #2609.
-            when(lifecycleManager.adopt("cid-1", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-1", Map.of(), Map.of(6443, 6512)));
+            when(lifecycleManager.adopt("cid-1", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-1", Map.of(), Map.of(443, 6512)));
 
             Cluster cluster = cluster();
             manager.restoreCluster(cluster);
@@ -458,8 +461,8 @@ class EksClusterManagerTest {
         void recreatesAnOldSurvivorWithoutCapacityLimits() {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(containerFromJson("{\"Id\":\"cid-old\"}")));
-            when(lifecycleManager.adopt("cid-old", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(6443, 6440)));
+            when(lifecycleManager.adopt("cid-old", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(443, 6440)));
             stubFreshStart("cid-new", 6440);
 
             Cluster cluster = cluster();
@@ -475,8 +478,8 @@ class EksClusterManagerTest {
         void restoresOldSurvivorWhenCapacityReplacementFails() {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(containerFromJson("{\"Id\":\"cid-old\"}")));
-            when(lifecycleManager.adopt("cid-old", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(6443, 6440)));
+            when(lifecycleManager.adopt("cid-old", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(443, 6440)));
             when(lifecycleManager.create(any())).thenReturn("cid-new");
             when(lifecycleManager.startCreated(any(), any()))
                     .thenThrow(new RuntimeException("replacement failed"));
@@ -617,8 +620,8 @@ class EksClusterManagerTest {
             when(lifecycleManager.create(any())).thenReturn("cid-new");
             when(lifecycleManager.startCreated(any(), any()))
                     .thenThrow(new IllegalStateException("replacement failed"));
-            when(lifecycleManager.adopt("cid-old", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(6443, 6441)));
+            when(lifecycleManager.adopt("cid-old", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(443, 6441)));
             Cluster cluster = cluster();
             cluster.setDockerName("floci-eks-demo");
             cluster.setContainerId("cid-old");
@@ -640,8 +643,8 @@ class EksClusterManagerTest {
         void backupCleanupFailureKeepsTheNewNodeRunning() {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(containerFromJson("{\"Id\":\"cid-old\"}")));
-            when(lifecycleManager.adopt("cid-old", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(6443, 6440)));
+            when(lifecycleManager.adopt("cid-old", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(443, 6440)));
             stubFreshStart("cid-new", 6440);
             Mockito.doNothing().doThrow(new IllegalStateException("Docker cleanup failed"))
                     .when(lifecycleManager).removeIfExistsStrict("floci-aws-eks-capacity-backup.demo");
@@ -650,7 +653,7 @@ class EksClusterManagerTest {
             manager.restoreCluster(cluster);
 
             assertEquals("cid-new", cluster.getContainerId());
-            verify(lifecycleManager, Mockito.times(1)).adopt("cid-old", List.of(6443));
+            verify(lifecycleManager, Mockito.times(1)).adopt("cid-old", List.of(443));
             verify(lifecycleManager, never()).removeIfExistsStrict("floci-eks-demo");
         }
 
@@ -672,7 +675,7 @@ class EksClusterManagerTest {
         void recreatesWhenTheSurvivingContainerPublishesNoPort() {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(survivingContainer("cid-1")));
-            when(lifecycleManager.adopt("cid-1", List.of(6443)))
+            when(lifecycleManager.adopt("cid-1", List.of(443)))
                     .thenReturn(new ContainerInfo("cid-1", Map.of()));
             stubFreshStart("cid-new", 6440);
 
@@ -746,8 +749,8 @@ class EksClusterManagerTest {
             when(lifecycleManager.findByName("floci-eks-demo")).thenReturn(Optional.empty());
             when(lifecycleManager.findByName("floci-eks-999999999999.demo"))
                     .thenReturn(Optional.of(survivingContainer("cid-9")));
-            when(lifecycleManager.adopt("cid-9", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-9", Map.of(), Map.of(6443, 6520)));
+            when(lifecycleManager.adopt("cid-9", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-9", Map.of(), Map.of(443, 6520)));
 
             Cluster cluster = cluster();
             cluster.setAccountId("999999999999");
@@ -775,8 +778,8 @@ class EksClusterManagerTest {
             when(config.defaultAccountId()).thenReturn("000000000000");
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(survivingContainerOwnedBy("cid-legacy", "999999999999")));
-            when(lifecycleManager.adopt("cid-legacy", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-legacy", Map.of(), Map.of(6443, 6512)));
+            when(lifecycleManager.adopt("cid-legacy", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-legacy", Map.of(), Map.of(443, 6512)));
 
             Cluster cluster = cluster();
             cluster.setAccountId("999999999999");
@@ -1680,7 +1683,7 @@ class EksClusterManagerTest {
                     "io.floci.eks.node-capacity", "m5.large:unbounded"));
             when(lifecycleManager.findByName("floci-eks-my-cluster")).thenReturn(Optional.of(container));
             when(lifecycleManager.adopt(anyString(), any())).thenReturn(
-                    new ContainerInfo("surviving-container-id", Map.of(6443, new ContainerLifecycleManager.EndpointInfo("localhost", 6500)), Map.of(6443, 6500)));
+                    new ContainerInfo("surviving-container-id", Map.of(443, new ContainerLifecycleManager.EndpointInfo("localhost", 6500)), Map.of(443, 6500)));
 
             Cluster cluster = new Cluster();
             cluster.setName("my-cluster");
@@ -2505,8 +2508,8 @@ class EksClusterManagerTest {
             when(lifecycleManager.findByName("floci-eks-prod-cluster")).thenReturn(Optional.of(container));
             when(lifecycleManager.adopt(anyString(), any())).thenReturn(
                     new ContainerInfo("adopted-container-id-12345678901234567890",
-                            Map.of(6443, new ContainerLifecycleManager.EndpointInfo("localhost", 6500)),
-                            Map.of(6443, 6500)));
+                            Map.of(443, new ContainerLifecycleManager.EndpointInfo("localhost", 6500)),
+                            Map.of(443, 6500)));
 
             Cluster cluster = new Cluster();
             cluster.setName("prod-cluster");

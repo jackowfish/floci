@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.elbv2;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
@@ -25,6 +26,10 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpVersion;
 import io.vertx.core.http.RequestOptions;
+import io.vertx.core.net.NetClient;
+import io.vertx.core.net.NetClientOptions;
+import io.vertx.core.net.NetServer;
+import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -35,6 +40,7 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -123,6 +129,10 @@ public class ElbV2DataPlane {
         if (config.services().elbv2().mock()) {
             return;
         }
+        if (isTcpListener(listener, region)) {
+            startTcpListener(listener, region);
+            return;
+        }
         String listenerArn = listener.getListenerArn();
         List<CompiledRule> compiled = compileRules(rules);
         ruleChains.put(listenerArn, new AtomicReference<>(compiled));
@@ -142,6 +152,11 @@ public class ElbV2DataPlane {
             return;
         }
         String listenerArn = listener.getListenerArn();
+        if (isTcpListener(listener, region)) {
+            stopTcpListener(listenerArn);
+            startTcpListener(listener, region);
+            return;
+        }
         ListenerBinding newBinding = binding(listener, region);
         ListenerBinding oldBinding = listenerBindings.get(listenerArn);
         if (newBinding.equals(oldBinding)) {
@@ -165,6 +180,7 @@ public class ElbV2DataPlane {
     }
 
     public void stopListener(String listenerArn) {
+        stopTcpListener(listenerArn);
         ListenerBinding binding = listenerBindings.remove(listenerArn);
         if (binding != null) {
             Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
@@ -932,6 +948,174 @@ public class ElbV2DataPlane {
         source.endHandler(ignored -> close.run());
         source.closeHandler(ignored -> close.run());
         source.exceptionHandler(err -> close.run());
+    }
+
+    // ── Network load balancer TCP listeners ────────────────────────────────────
+
+    private static final String PROXY_PROTOCOL_V2_ATTRIBUTE = "proxy_protocol_v2.enabled";
+    private static final long NLB_IDLE_TIMEOUT_MILLIS = 350_000;
+
+    /** The listener and region each TCP port serves; one network load balancer owns a port. */
+    private record TcpBinding(Listener listener, String region) {}
+
+    private final Map<Integer, NetServer> tcpServers = new ConcurrentHashMap<>();
+    private final Map<Integer, TcpBinding> tcpBindings = new ConcurrentHashMap<>();
+
+    private NetClient tcpClient;
+
+    /** True for a network load balancer listener that carries raw TCP or TLS, not HTTP. */
+    // Only network load balancers accept TCP, TLS and TCP_UDP listeners, so the protocol alone decides.
+    private boolean isTcpListener(Listener listener, String region) {
+        String protocol = listener.getProtocol();
+        return protocol != null && (protocol.equals("TCP") || protocol.equals("TLS") || protocol.equals("TCP_UDP"));
+    }
+
+    private void startTcpListener(Listener listener, String region) {
+        int port = listener.getPort();
+        if (isReservedByFloci(port)) {
+            LOG.warnv("NLB listener port {0} is reserved by Floci itself; the listener serves no traffic",
+                    String.valueOf(port));
+            return;
+        }
+        TcpBinding candidate = new TcpBinding(listener, region);
+        TcpBinding previous = tcpBindings.get(port);
+        if (previous != null && !previous.listener().getLoadBalancerArn().equals(listener.getLoadBalancerArn())
+                && createdTime(previous).isAfter(createdTime(candidate))) {
+            LOG.warnv("NLB port {0} stays with newer listener {1}; {2} serves no traffic",
+                    String.valueOf(port), previous.listener().getListenerArn(), listener.getListenerArn());
+            return;
+        }
+        tcpBindings.put(port, candidate);
+        if (previous != null && !previous.listener().getListenerArn().equals(listener.getListenerArn())) {
+            LOG.warnv("NLB port {0} moves from listener {1} to {2}; Floci gives each port to one load balancer",
+                    String.valueOf(port), previous.listener().getListenerArn(), listener.getListenerArn());
+        }
+        tcpServers.computeIfAbsent(port, this::startTcpPortServer);
+    }
+
+    // The newest load balancer keeps a shared port, so a leftover from a deleted stack cannot take it.
+    private Instant createdTime(TcpBinding binding) {
+        String lbArn = binding.listener().getLoadBalancerArn();
+        LoadBalancer loadBalancer = RequestScopes.callAs(arnAccount(lbArn),
+                () -> elbV2Service.getLoadBalancer(binding.region(), lbArn));
+        return loadBalancer == null || loadBalancer.getCreatedTime() == null ? Instant.EPOCH : loadBalancer.getCreatedTime();
+    }
+
+    private void stopTcpListener(String listenerArn) {
+        tcpBindings.entrySet().removeIf(entry -> {
+            if (!entry.getValue().listener().getListenerArn().equals(listenerArn)) {
+                return false;
+            }
+            NetServer server = tcpServers.remove(entry.getKey());
+            if (server != null) {
+                server.close();
+            }
+            return true;
+        });
+    }
+
+    private NetServer startTcpPortServer(int port) {
+        if (tcpClient == null) {
+            tcpClient = vertx.createNetClient(new NetClientOptions().setConnectTimeout(5000));
+        }
+        NetServer server = vertx.createNetServer(new NetServerOptions().setHost("0.0.0.0").setPort(port));
+        server.connectHandler(client -> {
+            try {
+                forwardTcp(client, port);
+            } catch (RuntimeException e) {
+                LOG.warnv(e, "NLB listener {0} dropped a connection: {1}", String.valueOf(port), e.getMessage());
+                client.close();
+            }
+        });
+        server.listen()
+                .onSuccess(s -> LOG.infov("NLB TCP listener started on {0}", String.valueOf(port)))
+                .onFailure(err -> {
+                    tcpServers.remove(port);
+                    LOG.warnv("NLB TCP listener failed to start on {0}: {1}", String.valueOf(port), err.getMessage());
+                });
+        return server;
+    }
+
+    /** Picks a target, connects, writes the PROXY v2 header when the target group asks, then relays. */
+    private void forwardTcp(NetSocket client, int port) {
+        client.pause();
+        TcpBinding binding = tcpBindings.get(port);
+        Action action = binding == null || binding.listener().getDefaultActions() == null ? null
+                : binding.listener().getDefaultActions().stream()
+                        .filter(a -> "forward".equals(a.getType())).findFirst().orElse(null);
+        String tgArn = action == null ? null : resolveTgArn(action);
+        // Connections carry no request scope, and ELBv2 state is stored per account.
+        TargetGroup tg = tgArn == null ? null : RequestScopes.callAs(arnAccount(tgArn),
+                () -> elbV2Service.getTargetGroup(binding.region(), tgArn));
+        if (tg == null || tg.getTargets() == null || tg.getTargets().isEmpty()) {
+            LOG.infov("NLB listener {0} has no target to forward to (target group {1})", String.valueOf(port), tgArn);
+            client.close();
+            return;
+        }
+        List<TargetDescription> allTargets = tg.getTargets();
+        List<TargetDescription> healthy = allTargets.stream()
+                .filter(t -> healthChecker.isHealthy(tgArn, t, ElbV2HealthChecker.effectivePort(t, tg)))
+                .collect(Collectors.toList());
+        List<TargetDescription> candidates = healthy.isEmpty() ? allTargets : healthy;
+        AtomicInteger counter = rrCounters.computeIfAbsent(tgArn, k -> new AtomicInteger(0));
+        TargetDescription target = candidates.get(Math.abs(counter.getAndIncrement() % candidates.size()));
+        int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
+        String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        boolean proxyProtocol = tg.getAttributes() != null
+                && Boolean.parseBoolean(tg.getAttributes().get(PROXY_PROTOCOL_V2_ATTRIBUTE));
+        tcpClient.connect(targetPort, host).onSuccess(upstream -> {
+            if (proxyProtocol) {
+                upstream.write(proxyProtocolV2Header(client.remoteAddress(), client.localAddress()));
+            }
+            tunnel(client, upstream, NLB_IDLE_TIMEOUT_MILLIS);
+            client.resume();
+        }).onFailure(err -> {
+            LOG.infov("NLB could not reach target {0}:{1}: {2}", host, String.valueOf(targetPort), err.getMessage());
+            client.close();
+        });
+    }
+
+    private static String arnAccount(String arn) {
+        String[] parts = arn == null ? new String[0] : arn.split(":", 6);
+        return parts.length > 4 && !parts[4].isEmpty() ? parts[4] : null;
+    }
+
+    private static final byte[] PROXY_V2_SIGNATURE = {
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A};
+
+    /** Builds a PROXY protocol v2 header for a TCP over IPv4 connection, as an NLB sends it. */
+    static Buffer proxyProtocolV2Header(io.vertx.core.net.SocketAddress source,
+                                        io.vertx.core.net.SocketAddress destination) {
+        Buffer header = Buffer.buffer().appendBytes(PROXY_V2_SIGNATURE);
+        byte[] src = ipv4Bytes(source.hostAddress());
+        byte[] dst = ipv4Bytes(destination.hostAddress());
+        if (src == null || dst == null) {
+            // LOCAL command: the receiver uses the connection's own addresses.
+            return header.appendByte((byte) 0x20).appendByte((byte) 0x00).appendShort((short) 0);
+        }
+        return header.appendByte((byte) 0x21)   // version 2, PROXY command
+                .appendByte((byte) 0x11)        // TCP over IPv4
+                .appendShort((short) 12)
+                .appendBytes(src)
+                .appendBytes(dst)
+                .appendShort((short) source.port())
+                .appendShort((short) destination.port());
+    }
+
+    private static byte[] ipv4Bytes(String address) {
+        if (address == null) {
+            return null;
+        }
+        String plain = address.startsWith("::ffff:") ? address.substring(7) : address;
+        String[] parts = plain.split("\\.");
+        if (parts.length != 4) {
+            return null;
+        }
+        byte[] bytes = new byte[4];
+        for (int i = 0; i < 4; i++) {
+            bytes[i] = (byte) Integer.parseInt(parts[i]);
+        }
+        return bytes;
     }
 
     private void executeRedirect(io.vertx.core.http.HttpServerRequest req, Action action) {

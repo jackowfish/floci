@@ -768,6 +768,15 @@ public class VpcNetworkManager {
         if (!vpc.created) {
             return;
         }
+        if (vpc.flociContainerId != null) {
+            // Floci joined the network itself, and Docker refuses to remove a network with endpoints.
+            try {
+                dockerClient.disconnectFromNetworkCmd().withContainerId(vpc.flociContainerId)
+                        .withNetworkId(vpc.networkName).withForce(true).exec();
+            } catch (Exception e) {
+                LOG.debugv("Could not detach Floci from VPC network {0}: {1}", vpc.networkName, e.getMessage());
+            }
+        }
         removeNetworkWithRetry(vpc.networkName, 1);
     }
 

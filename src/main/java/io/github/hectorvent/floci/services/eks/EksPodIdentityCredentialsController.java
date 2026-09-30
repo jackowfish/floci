@@ -116,8 +116,10 @@ public class EksPodIdentityCredentialsController {
         String namespace = rest.substring(0, colon);
         String serviceAccount = rest.substring(colon + 1);
 
-        Optional<PodIdentityAssociation> maybeAssociation = associationService.findAssociation(
-                cluster, namespace, serviceAccount);
+        // The request carries no SigV4 signature, so the association lookup runs in the cluster's account.
+        Optional<PodIdentityAssociation> maybeAssociation = io.github.hectorvent.floci.core.common.RequestScopes
+                .callAs(cluster.getAccountId(), () -> associationService.findAssociation(
+                        cluster, namespace, serviceAccount));
         if (maybeAssociation.isEmpty()) {
             return error(404, "ResourceNotFoundException: No association found for service account: "
                     + serviceAccount + "\n");

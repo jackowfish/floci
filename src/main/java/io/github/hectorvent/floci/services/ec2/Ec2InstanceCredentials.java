@@ -27,7 +27,18 @@ final class Ec2InstanceCredentials {
     }
 
     synchronized void register(Instance instance) {
-        sessions.computeIfAbsent(instance, ignored -> new ArrayList<>());
+        sessions.computeIfAbsent(instance, ignored -> adopt(instance));
+    }
+
+    /** Takes over credentials that a previous server issued, so a restart does not revoke cached keys. */
+    private List<Issued> adopt(Instance instance) {
+        List<Issued> history = new ArrayList<>();
+        if (iam != null && instance.getInstanceId() != null) {
+            for (SessionCredential session : iam.findEc2InstanceSessions(instance.getInstanceId())) {
+                history.add(new Issued(session, session.getEc2RoleId(), instance.getIamInstanceProfileArn()));
+            }
+        }
+        return history;
     }
 
     synchronized void unregister(Instance instance) {

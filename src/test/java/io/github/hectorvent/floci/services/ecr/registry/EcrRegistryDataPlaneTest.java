@@ -80,6 +80,27 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
+    void awsShapedHostAndMirrorNamespaceMapToTheSameRepository() {
+        // Docker pushes with the real ECR name as the host.
+        var push = EcrRegistryDataPlane.requestFor(
+                "123456789012.dkr.ecr.us-east-2.amazonaws.com",
+                "/v2/qm-build/manifests/v1", null, "hostname").orElseThrow();
+        assertEquals("123456789012/us-east-2/qm-build", push.storageRepositoryName());
+        assertEquals("/v2/123456789012/us-east-2/qm-build/manifests/v1", push.backendUri());
+
+        // containerd pulls through a mirror and names the original registry in "ns".
+        var pull = EcrRegistryDataPlane.requestFor(
+                "floci:4566", "/v2/qm-build/manifests/v1",
+                "ns=123456789012.dkr.ecr.us-east-2.amazonaws.com", "hostname").orElseThrow();
+        assertEquals(push.storageRepositoryName(), pull.storageRepositoryName());
+        assertEquals(push.backendUri(), pull.backendUri());
+
+        assertFalse(EcrRegistryDataPlane.requestFor(
+                "123456789012.dkr.ecr.us-east-2.amazonaws.com.evil.example",
+                "/v2/repo/manifests/latest", null, "hostname").isPresent());
+    }
+
+    @Test
     void malformedAccountOrNonEcrHostIsRejected() {
         // Less than 12 digits
         assertFalse(EcrRegistryDataPlane.requestFor(

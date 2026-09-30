@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.elbv2.model.*;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -28,6 +29,7 @@ import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Map;
 import java.util.Set;
 
@@ -65,6 +67,7 @@ public class ElbV2Service implements ResourceProvider {
 
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
+    private java.util.function.Supplier<Set<String>> listenerAccounts = Set::of;
 
     @PostConstruct
     void initializeStorage()
@@ -76,8 +79,14 @@ public class ElbV2Service implements ResourceProvider {
                 new TypeReference<Map<String, Map<String, LoadBalancer>>>() {});
         this.targetGroups = storageBacked("elbv2-target-groups.json",
                 new TypeReference<Map<String, Map<String, TargetGroup>>>() {});
-        this.listeners = storageBacked("elbv2-listeners.json",
-                new TypeReference<Map<String, Map<String, Listener>>>() {});
+        io.github.hectorvent.floci.core.storage.StorageBackend<String, Map<String, Listener>> listenerStore =
+                storageFactory.create("elbv2", "elbv2-listeners.json",
+                        new TypeReference<Map<String, Map<String, Listener>>>() {});
+        this.listenerAccounts = () -> listenerStore instanceof AccountAwareStorageBackend<Map<String, Listener>> aware
+                ? aware.scanAllAccountEntries(key -> true).stream()
+                        .map(AccountAwareStorageBackend.AccountEntry::accountId).collect(Collectors.toSet())
+                : Set.of();
+        this.listeners = new StorageBackedMap<>(listenerStore);
         this.rules = storageBacked("elbv2-rules.json",
                 new TypeReference<Map<String, Map<String, Rule>>>() {});
         this.tags = storageBacked("elbv2-tags.json",
@@ -162,6 +171,19 @@ public class ElbV2Service implements ResourceProvider {
      */
     public void restorePersistedRuntime()
     {
+        // Storage is scoped to the request's account, so each account restores under its own scope.
+        Set<String> accounts = new LinkedHashSet<>(listenerAccounts.get());
+        accounts.add(regionResolver.getAccountId());
+        for (String accountId : accounts) {
+            io.github.hectorvent.floci.core.common.RequestScopes.callAs(accountId, () -> {
+                restorePersistedRuntimeForAccount();
+                return null;
+            });
+        }
+    }
+
+    private void restorePersistedRuntimeForAccount()
+    {
         refreshCanonicalHostedZones();
         if (healthChecker != null) {
             for (Map<String, TargetGroup> regionTargetGroups : targetGroups.values()) {
@@ -191,15 +213,19 @@ public class ElbV2Service implements ResourceProvider {
                                            Map<String, String> initialTags) {
         validateName(name, "load balancer");
         Map<String, LoadBalancer> regionLbs = loadBalancers.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
-        boolean duplicate = regionLbs.values().stream()
-                .anyMatch(lb -> lb.getLoadBalancerName().equals(name));
-        if (duplicate) {
+        String lbType = type != null ? type : "application";
+        String lbScheme = scheme != null ? scheme : "internet-facing";
+        Optional<LoadBalancer> existing = regionLbs.values().stream()
+                .filter(lb -> lb.getLoadBalancerName().equals(name)).findFirst();
+        if (existing.isPresent()) {
+            // AWS returns the existing load balancer when a create repeats its name and settings.
+            if (lbType.equals(existing.get().getType()) && lbScheme.equals(existing.get().getScheme())) {
+                return existing.get();
+            }
             throw new AwsException("DuplicateLoadBalancerName",
                     "A load balancer with name '" + name + "' already exists.", 400);
         }
 
-        String lbType = type != null ? type : "application";
-        String lbScheme = scheme != null ? scheme : "internet-facing";
         String ipType = ipAddressType != null ? ipAddressType : "ipv4";
         String typePrefix = lbTypePrefix(lbType);
         String id = randomHex16();

@@ -123,7 +123,7 @@ public class ElbV2QueryHandler {
         String scheme = p.getFirst("Scheme");
         String type = p.getFirst("Type");
         String ipAddressType = p.getFirst("IpAddressType");
-        List<String> subnets = memberList(p, "Subnets");
+        List<String> subnets = subnetList(p);
         List<String> securityGroups = memberList(p, "SecurityGroups");
         Map<String, String> tags = parseTags(p);
 
@@ -255,7 +255,7 @@ public class ElbV2QueryHandler {
 
     private Response handleSetSubnets(MultivaluedMap<String, String> p, String region) {
         String arn = p.getFirst("LoadBalancerArn");
-        List<String> subnets = memberList(p, "Subnets");
+        List<String> subnets = subnetList(p);
         service.setSubnets(region, arn, subnets);
         return voidResponse("SetSubnetsResponse");
     }
@@ -1062,6 +1062,18 @@ public class ElbV2QueryHandler {
     }
 
     // ── Parsing helpers ───────────────────────────────────────────────────────
+
+    /** The subnet ids from Subnets, or from SubnetMappings when a caller maps subnets instead. */
+    private List<String> subnetList(MultivaluedMap<String, String> p) {
+        List<String> subnets = memberList(p, "Subnets");
+        if (!subnets.isEmpty()) {
+            return subnets;
+        }
+        for (int i = 1; p.getFirst("SubnetMappings.member." + i + ".SubnetId") != null; i++) {
+            subnets.add(p.getFirst("SubnetMappings.member." + i + ".SubnetId"));
+        }
+        return subnets;
+    }
 
     private List<String> memberList(MultivaluedMap<String, String> p, String prefix) {
         List<String> result = new ArrayList<>();
