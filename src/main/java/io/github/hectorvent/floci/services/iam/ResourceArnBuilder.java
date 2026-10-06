@@ -5,6 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.iam.model.IamGroup;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.ServerCertificate;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
@@ -21,6 +26,7 @@ import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 
@@ -87,6 +93,9 @@ public class ResourceArnBuilder {
             case "ssm"            -> List.of(buildSsmArn(ctx, region, accountId));
             case "kms"            -> List.of(buildKmsArn(path, region, accountId));
             case "iam"            -> buildIamArns(ctx, region, accountId);
+            case "ec2"            -> List.of(buildEc2Arn(ctx, region, accountId));
+            case "events"         -> List.of(buildEventsRuleArn(ctx, region, accountId));
+            case "eks"            -> List.of(buildEksArn(path, region, accountId));
             default               -> List.of("*");
         };
     }
@@ -94,12 +103,10 @@ public class ResourceArnBuilder {
     // ── IAM ─────────────────────────────────────────────────────────────────────
 
     /**
-     * IAM resource ARNs are only built for the server-certificate operations. Every other IAM
-     * action still resolves to {@code *}, so a policy naming a specific user, role, policy or MFA
-     * device does not constrain it. That is how IAM behaved before server certificates existed,
-     * and closing it for the rest means mapping the resource of every dispatched IAM action, which
-     * is its own change rather than a side effect of this one: tracked in issue 4979, and
-     * described in docs/services/iam.md.
+     * IAM resource ARNs are built for the server-certificate operations and for calls that name a
+     * user, role, group, instance profile, managed policy or OIDC provider. Other IAM actions,
+     * such as those on MFA devices or SAML providers, still resolve to {@code *}: the rest of
+     * issue 4979, described in docs/services/iam.md.
      *
      * <p>The operation is resolved through {@link AwsQueryServiceResolver#action(String, String)},
      * so the legacy {@code Operation} parameter names the resource exactly as {@code Action} does.
@@ -116,8 +123,11 @@ public class ResourceArnBuilder {
         String action = AwsQueryServiceResolver.action(
                 RequestBodyReader.formField(ctx, "Action"),
                 RequestBodyReader.formField(ctx, "Operation"));
-        if (action == null || !SERVER_CERTIFICATE_ACTIONS.contains(action)) {
+        if (action == null) {
             return List.of("*");
+        }
+        if (!SERVER_CERTIFICATE_ACTIONS.contains(action)) {
+            return buildIamEntityArns(ctx, action, region, accountId);
         }
         String name = RequestBodyReader.formField(ctx, "ServerCertificateName");
         if (name == null || name.isBlank()) {
@@ -198,6 +208,158 @@ public class ResourceArnBuilder {
         return iamService.get().findServerCertificate(name)
                 .filter(certificate -> certificate.getArn() != null
                         && !certificate.getArn().isBlank());
+    }
+
+    /** IAM entity parameters, most specific first: a call that names a profile or group acts on it. */
+    private static final String[][] IAM_ENTITY_PARAMETERS = {
+            {"InstanceProfileName", "instance-profile"}, {"GroupName", "group"},
+            {"RoleName", "role"}, {"UserName", "user"}};
+
+    /**
+     * The ARN of the user, role, group or instance profile a call names. A create mints it from the
+     * request's Path; other calls use the stored ARN, which carries the path.
+     */
+    private List<String> buildIamEntityArns(ContainerRequestContext ctx, String action, String region,
+                                            String accountId) {
+        for (String[] parameter : IAM_ENTITY_PARAMETERS) {
+            String name = RequestBodyReader.formField(ctx, parameter[0]);
+            if (name == null || name.isBlank()) {
+                continue;
+            }
+            String type = parameter[1];
+            if (action.equalsIgnoreCase("Create" + type.replace("-", ""))) {
+                String path = normalizeArnPath(RequestBodyReader.formField(ctx, "Path"));
+                return List.of(AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam",
+                        accountId, type + path + name).toString());
+            }
+            return storedIamEntityArn(type, name, accountId).map(List::of).orElse(List.of("*"));
+        }
+        // Attach*Policy names a principal too, so the policy ARN only applies when no principal is named.
+        for (String parameter : new String[] {"PolicyArn", "OpenIDConnectProviderArn"}) {
+            String arn = RequestBodyReader.formField(ctx, parameter);
+            if (arn != null && !arn.isBlank()) {
+                return List.of(arn);
+            }
+        }
+        return List.of("*");
+    }
+
+    private Optional<String> storedIamEntityArn(String type, String name, String accountId) {
+        if (iamService == null) {
+            return Optional.empty();
+        }
+        IamService iam = iamService.get();
+        Optional<String> arn = switch (type) {
+            case "instance-profile" -> iam.findInstanceProfile(accountId, name).map(InstanceProfile::getArn);
+            case "role" -> iam.findRole(accountId, name).map(IamRole::getArn);
+            case "user" -> iam.findUser(accountId, name).map(IamUser::getArn);
+            case "group" -> findGroup(iam, name).map(IamGroup::getArn);
+            default -> Optional.empty();
+        };
+        return arn.filter(value -> !value.isBlank());
+    }
+
+    private static Optional<IamGroup> findGroup(IamService iam, String name) {
+        try {
+            return Optional.ofNullable(iam.getGroup(name));
+        } catch (AwsException e) {
+            return Optional.empty();
+        }
+    }
+
+    // ── EC2 ─────────────────────────────────────────────────────────────────────
+    // Scoped EC2 policies name a resource type, such as launch-template/* or instance/*.
+
+    private static final Map<String, String> EC2_ACTION_RESOURCE_TYPES = Map.ofEntries(
+            Map.entry("CreateLaunchTemplate", "launch-template"),
+            Map.entry("CreateLaunchTemplateVersion", "launch-template"),
+            Map.entry("ModifyLaunchTemplate", "launch-template"),
+            Map.entry("DeleteLaunchTemplate", "launch-template"),
+            Map.entry("CreateFleet", "fleet"),
+            Map.entry("RunInstances", "instance"),
+            Map.entry("TerminateInstances", "instance"),
+            Map.entry("StartInstances", "instance"),
+            Map.entry("StopInstances", "instance"),
+            Map.entry("RebootInstances", "instance"),
+            Map.entry("CreateVolume", "volume"),
+            Map.entry("DeleteVolume", "volume"),
+            Map.entry("AttachVolume", "volume"),
+            Map.entry("DetachVolume", "volume"),
+            Map.entry("ModifyVolume", "volume"),
+            Map.entry("CreateSnapshot", "snapshot"),
+            Map.entry("DeleteSnapshot", "snapshot"));
+
+    private static final Map<String, String> EC2_ID_PREFIX_RESOURCE_TYPES = Map.ofEntries(
+            Map.entry("i-", "instance"),
+            Map.entry("lt-", "launch-template"),
+            Map.entry("fleet-", "fleet"),
+            Map.entry("vol-", "volume"),
+            Map.entry("snap-", "snapshot"),
+            Map.entry("sg-", "security-group"),
+            Map.entry("subnet-", "subnet"),
+            Map.entry("vpc-", "vpc"),
+            Map.entry("eni-", "network-interface"),
+            Map.entry("rtb-", "route-table"),
+            Map.entry("igw-", "internet-gateway"),
+            Map.entry("nat-", "natgateway"),
+            Map.entry("eipalloc-", "elastic-ip"));
+
+    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = RequestBodyReader.formField(ctx, "Action");
+        if (action == null) {
+            return "*";
+        }
+        String type = EC2_ACTION_RESOURCE_TYPES.get(action);
+        boolean tagging = "CreateTags".equals(action) || "DeleteTags".equals(action);
+        String id = tagging ? RequestBodyReader.formField(ctx, "ResourceId.1")
+                : firstNonEmpty(ctx, "InstanceId.1", "LaunchTemplateId", "VolumeId", "SnapshotId");
+        if (type == null && tagging && id != null) {
+            type = EC2_ID_PREFIX_RESOURCE_TYPES.entrySet().stream()
+                    .filter(e -> id.startsWith(e.getKey())).map(Map.Entry::getValue).findFirst().orElse(null);
+        }
+        if (type == null) {
+            return "*";
+        }
+        String name = id == null || id.isEmpty() || action.startsWith("Create") && !tagging ? "*" : id;
+        return AwsArnUtils.Arn.of("ec2", region, accountId, type + "/" + name).toString();
+    }
+
+    private static String firstNonEmpty(ContainerRequestContext ctx, String... keys) {
+        for (String key : keys) {
+            String value = RequestBodyReader.formField(ctx, key);
+            if (value != null && !value.isEmpty()) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    // ── EventBridge ─────────────────────────────────────────────────────────────
+
+    private String buildEventsRuleArn(ContainerRequestContext ctx, String region, String accountId) {
+        JsonNode json = readJsonBody(ctx);
+        if (json == null || !json.isObject()) {
+            return "*";
+        }
+        String rule = json.hasNonNull("Rule") ? json.get("Rule").asText()
+                : json.hasNonNull("Name") ? json.get("Name").asText() : null;
+        if (rule == null || rule.isBlank()) {
+            return "*";
+        }
+        String bus = json.hasNonNull("EventBusName") ? json.get("EventBusName").asText() : "default";
+        String resource = "default".equals(bus) ? "rule/" + rule : "rule/" + bus + "/" + rule;
+        return AwsArnUtils.Arn.of("events", region, accountId, resource).toString();
+    }
+
+    // ── EKS ─────────────────────────────────────────────────────────────────────
+
+    private String buildEksArn(String path, String region, String accountId) {
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        String[] parts = stripped.split("/");
+        if (parts.length < 2 || !"clusters".equals(parts[0]) || parts[1].isEmpty()) {
+            return "*";
+        }
+        return AwsArnUtils.Arn.of("eks", region, accountId, "cluster/" + parts[1]).toString();
     }
 
     // ── S3 ──────────────────────────────────────────────────────────────────────

@@ -48,9 +48,10 @@ class ServiceQuotasServiceTest {
     @Test
     void vpcResolvesRealQuotaCodesWithNamesThroughGetAndList() {
         Map<String, String> want = Map.of(
+                "L-F678F1CE", "VPCs per Region",
                 "L-FE5A380F", "NAT gateways per Availability Zone",
                 "L-2AEEBF1A", "Rules per network ACL");
-        Map<String, Double> defaults = Map.of("L-FE5A380F", 5.0, "L-2AEEBF1A", 20.0);
+        Map<String, Double> defaults = Map.of("L-F678F1CE", 5.0, "L-FE5A380F", 5.0, "L-2AEEBF1A", 20.0);
         for (Map.Entry<String, String> e : want.entrySet()) {
             JsonNode quota = service.getServiceQuota("vpc", e.getKey(), "us-east-1", "000000000000").path("Quota");
             assertEquals(e.getKey(), quota.path("QuotaCode").asText());

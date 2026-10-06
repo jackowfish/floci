@@ -3321,6 +3321,18 @@ public interface EmulatorConfig {
         boolean imdsPodNetwork();
 
         /**
+         * When true, node groups and EC2 instances that carry an EKS NodeConfig join the cluster as
+         * k3s agent containers. The server then runs without the k3s ServiceLB and metrics-server,
+         * which EKS does not have.
+         */
+        @WithDefault("false")
+        boolean workerNodes();
+
+        /** The most agent containers one node group starts, whatever its desired size. */
+        @WithDefault("3")
+        int maxNodesPerNodegroup();
+
+        /**
          * When true, configures k3s with the cluster's per-cluster OIDC signing keypair and
          * advertises Floci's OIDC issuer URL, enabling in-cluster IAM Roles for Service Accounts (IRSA).
          */

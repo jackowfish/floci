@@ -153,10 +153,13 @@ public class ElbV2HealthChecker implements Resettable {
             int unhealthyThreshold = tg.getUnhealthyThresholdCount() != null ? tg.getUnhealthyThresholdCount() : 2;
             int probePort = healthCheckPort(tg, port);
 
+            boolean tcpCheck = "TCP".equalsIgnoreCase(tg.getHealthCheckProtocol());
+            boolean proxyProtocol = tg.getAttributes() != null
+                    && Boolean.parseBoolean(tg.getAttributes().get("proxy_protocol_v2.enabled"));
             vertx.executeBlocking(() -> {
-                return probe(host, probePort, path, timeout);
+                return tcpCheck ? probeTcp(host, probePort, timeout, proxyProtocol) : probe(host, probePort, path, timeout);
             }).onSuccess(statusCode -> {
-                boolean success = matchesStatusCode(statusCode, matcher);
+                boolean success = tcpCheck || matchesStatusCode(statusCode, matcher);
                 if (success) {
                     state.consecutiveFailures = 0;
                     state.consecutiveSuccesses++;
@@ -192,6 +195,23 @@ public class ElbV2HealthChecker implements Resettable {
                 }
                 LOG.debugv("Health check failed for {0}:{1} - {2}", host, port, err.getMessage());
             });
+        }
+    }
+
+    /** A TCP health check passes when the connection opens; it reports as a 200 to share the matcher. */
+    // An NLB health check sends a LOCAL PROXY v2 header, or the target logs a broken header.
+    private static final byte[] PROXY_V2_LOCAL_HEADER = {
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, 0x20, 0x00, 0x00, 0x00};
+
+    private int probeTcp(String host, int port, int timeoutSeconds, boolean proxyProtocol) throws IOException {
+        try (java.net.Socket socket = new java.net.Socket()) {
+            socket.connect(new java.net.InetSocketAddress(ElbV2TargetResolver.resolveCheckedAddress(host), port),
+                    timeoutSeconds * 1000);
+            if (proxyProtocol) {
+                socket.getOutputStream().write(PROXY_V2_LOCAL_HEADER);
+                socket.getOutputStream().flush();
+            }
+            return 200;
         }
     }
 

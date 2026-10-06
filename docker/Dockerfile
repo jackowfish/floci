@@ -8,7 +8,7 @@ COPY pom.xml .
 RUN mvn dependency:go-offline -q
 
 COPY src/ src/
-RUN mvn clean package -DskipTests -q
+RUN mvn clean package -Dmaven.test.skip=true -q
 
 # Stage 2: Runtime
 FROM eclipse-temurin:25-jre-noble
@@ -51,8 +51,10 @@ RUN mkdir -p /app/data /etc/floci/aws \
 COPY --from=build /build/target/quarkus-app/ quarkus-app/
 RUN chown -R 1001:root /app/quarkus-app
 
-COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-COPY --chmod=755 docker/localstack-parity.sh /usr/local/bin/localstack-parity.sh
+COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
+COPY docker/localstack-parity.sh /usr/local/bin/localstack-parity.sh
+RUN chmod 755 /usr/local/bin/localstack-parity.sh
 
 VOLUME /app/data
 

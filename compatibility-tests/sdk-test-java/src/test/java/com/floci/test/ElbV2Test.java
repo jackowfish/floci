@@ -192,11 +192,11 @@ class ElbV2Test {
 
     @Test
     @Order(4)
-    @DisplayName("CreateLoadBalancer - duplicate name throws DuplicateLoadBalancerNameException")
+    @DisplayName("CreateLoadBalancer - duplicate name with other settings throws DuplicateLoadBalancerNameException")
     void createLoadBalancerDuplicateName() {
         assertThatThrownBy(() -> elb.createLoadBalancer(CreateLoadBalancerRequest.builder()
                 .name(LB_NAME)
-                .type(LoadBalancerTypeEnum.APPLICATION)
+                .type(LoadBalancerTypeEnum.NETWORK)
                 .build()))
                 .isInstanceOf(DuplicateLoadBalancerNameException.class);
     }

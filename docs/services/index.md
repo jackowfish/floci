@@ -22,7 +22,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Lambda MicroVMs](lambda-microvms.md) | `/2025-09-09/...` + `/2026-04-04/...` | REST JSON | 22 |
 | [API Gateway v1](api-gateway.md) | `/restapis/...` | REST JSON | 79 |
 | [API Gateway v2](api-gateway.md#v2) | `/v2/apis/...` | REST JSON | 53 + data-plane |
-| [IAM](iam.md) | `POST /` with `Action=` param | Query | 158 |
+| [IAM](iam.md) | `POST /` with `Action=` param | Query | 161 |
 | [STS](sts.md) | `POST /` with `Action=` param | Query | 7 |
 | [AWS Sign-In](iam.md#aws-sign-in-login-credentials) | `/v1/authorize`, `/v1/token` | REST JSON | 2 |
 | [Organizations](organizations.md) | `POST /` + `X-Amz-Target: AWSOrganizationsV20161128.*` | JSON 1.1 | 56 |
@@ -46,7 +46,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [CloudWatch Metrics](cloudwatch.md#metrics) | `POST /` with `Action=` or JSON 1.1 | Query / JSON | 11 |
 | [CloudWatch RUM](rum.md) | `/appmonitor`, `/appmonitor/{name}`, `/appmonitors` | REST JSON | 5 |
 | [GuardDuty](guardduty.md) | `/detector`, `/detector/{detectorId}`, `/detector/{detectorId}/admin`, `/admin/*`, `/tags/*` | REST JSON | 13 |
-| [AWS Account Management](account.md) | `/putAlternateContact`, `/getAlternateContact` | REST JSON | 2 |
+| [AWS Account Management](account.md) | `/putAlternateContact`, `/getAlternateContact`, `/listRegions` | REST JSON | 3 |
 | [IAM Access Analyzer](access-analyzer.md) | `/analyzer`, `/analyzer/{name}` | REST JSON | 3 |
 | [IAM Identity Center (SSO Admin)](ssoadmin.md) | `POST /` + `X-Amz-Target: SWBExternalService.*` | JSON 1.1 | 79 |
 | [IAM Identity Center OIDC](ssooidc.md) | `/client/register`, `/device_authorization`, `/token`, `/token?aws_iam=t`, `/authorize`, `/device` | REST JSON | 4 |

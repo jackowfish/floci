@@ -469,6 +469,17 @@ public class TlsConfigSource implements ConfigSource {
             LOG.debugv("TLS: extracted hostname from floci.hostname: {0}", hostname);
         }
 
+        // EKS worker-node pods reach Floci under real AWS hostnames through cluster DNS.
+        if ("true".equalsIgnoreCase(resolveProperty("floci.services.eks.worker-nodes", "false"))) {
+            AwsPartitions.all().forEach(partition -> hostnames.add("*." + partition.dnsSuffix()));
+            for (String region : AwsRegions.KNOWN_IDS.stream().sorted().toList()) {
+                String suffix = AwsRegions.dnsSuffixFor(region);
+                hostnames.add("*." + region + "." + suffix);
+                // Docker clients push to <account>.dkr.ecr.<region>.<suffix>, which "*.<region>" does not cover.
+                hostnames.add("*.dkr.ecr." + region + "." + suffix);
+            }
+        }
+
         // Extract from FLOCI_BASE_URL
         String baseUrl = resolveProperty("floci.base-url", "http://localhost:4566");
         try {

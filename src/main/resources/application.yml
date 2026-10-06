@@ -699,6 +699,8 @@ floci:
       default-storage-class: false # start k3s without its bundled local-path provisioner to match EKS
       imds: false                  # expose link-local IMDS (169.254.169.254) inside the cluster container
       imds-pod-network: false      # route link-local IMDS traffic from ordinary pod network namespaces (requires imds: true)
+      worker-nodes: false          # run node groups and EKS EC2 instances as k3s agent containers
+      max-nodes-per-nodegroup: 3   # cap on agent containers per node group
       irsa-signing-key: true       # sign k3s service account tokens with the cluster OIDC key
       pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials (needs floci.tls.enabled)
       embedded-dns: true           # point cluster containers at Floci's embedded DNS to resolve Route 53 private zones

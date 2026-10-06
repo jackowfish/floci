@@ -477,7 +477,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String servingScope = catalog.byExternalKey(service)
                     .map(descriptor -> iamServiceScope(descriptor, claimedScope))
                     .orElseGet(() -> catalog.canonicalCredentialScope(service));
-            return new ResolvedAuthorization(servingScope, servingScope + ":" + queryAction);
+            return new ResolvedAuthorization(servingScope,
+                    io.github.hectorvent.floci.services.iam.IamActionRegistry.iamPrefix(servingScope) + ":" + queryAction);
         }
 
         boolean rest = claimValue instanceof ProtocolClaim claim && claim.protocol() == WireProtocol.REST;

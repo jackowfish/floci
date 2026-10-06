@@ -171,6 +171,11 @@ public class IamQueryHandler {
             case "UpdateAccountPasswordPolicy" -> handleUpdateAccountPasswordPolicy(params);
             case "DeleteAccountPasswordPolicy" -> handleDeleteAccountPasswordPolicy(params);
 
+            // Outbound Web Identity Federation
+            case "EnableOutboundWebIdentityFederation" -> handleEnableOutboundWebIdentityFederation();
+            case "DisableOutboundWebIdentityFederation" -> handleDisableOutboundWebIdentityFederation();
+            case "GetOutboundWebIdentityFederationInfo" -> handleGetOutboundWebIdentityFederationInfo();
+
             // Groups
             case "CreateGroup" -> handleCreateGroup(params);
             case "GetGroup" -> handleGetGroup(params);
@@ -1085,6 +1090,29 @@ public class IamQueryHandler {
     private Response handleDeleteAccountAlias(MultivaluedMap<String, String> params) {
         iamService.deleteAccountAlias(getParam(params, "AccountAlias"));
         return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteAccountAlias", AwsNamespaces.IAM)).build();
+    }
+
+    // =========================================================================
+    // Outbound Web Identity Federation
+    // =========================================================================
+
+    private Response handleEnableOutboundWebIdentityFederation() {
+        String issuer = iamService.enableOutboundWebIdentityFederation();
+        return Response.ok(AwsQueryResponse.envelope("EnableOutboundWebIdentityFederation", AwsNamespaces.IAM,
+                new XmlBuilder().elem("IssuerIdentifier", issuer).build())).build();
+    }
+
+    private Response handleDisableOutboundWebIdentityFederation() {
+        iamService.disableOutboundWebIdentityFederation();
+        return Response.ok(AwsQueryResponse.envelopeNoResult("DisableOutboundWebIdentityFederation", AwsNamespaces.IAM))
+                .build();
+    }
+
+    private Response handleGetOutboundWebIdentityFederationInfo() {
+        String issuer = iamService.getOutboundWebIdentityIssuer().orElseThrow(() -> new AwsException("FeatureDisabled",
+                "Outbound web identity federation is not enabled for this account.", 409));
+        return Response.ok(AwsQueryResponse.envelope("GetOutboundWebIdentityFederationInfo", AwsNamespaces.IAM,
+                new XmlBuilder().elem("IssuerIdentifier", issuer).elem("JwtVendingEnabled", true).build())).build();
     }
 
     // =========================================================================
