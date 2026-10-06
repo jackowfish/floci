@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.ServerCertificate;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -263,7 +266,7 @@ class ResourceArnBuilderTest {
     }
 
     /**
-     * ListServerCertificates names no certificate, and every other IAM action is still unmapped,
+     * ListServerCertificates names no certificate, and this builder has no store to find bob in,
      * so both resolve to the wildcard rather than to a fabricated ARN.
      */
     @Test
@@ -276,6 +279,60 @@ class ResourceArnBuilderTest {
 
         setFormBody("Action=DeleteServerCertificate");
         assertEquals("*", builder.build("iam", ctx, "us-east-1", "000000000000"));
+    }
+
+    /** A builder whose store holds one role, one user and one instance profile, each under a path. */
+    private ResourceArnBuilder backedByEntities() {
+        IamService service = mock(IamService.class);
+        IamRole role = new IamRole();
+        role.setArn("arn:aws:iam::000000000000:role/svc/app");
+        IamUser user = new IamUser();
+        user.setArn("arn:aws:iam::000000000000:user/team/bob");
+        InstanceProfile profile = new InstanceProfile();
+        profile.setArn("arn:aws:iam::000000000000:instance-profile/nodes/workers");
+        when(service.findRole("000000000000", "app")).thenReturn(Optional.of(role));
+        when(service.findUser("000000000000", "bob")).thenReturn(Optional.of(user));
+        when(service.findInstanceProfile("000000000000", "workers")).thenReturn(Optional.of(profile));
+        @SuppressWarnings("unchecked")
+        Instance<IamService> instance = mock(Instance.class);
+        when(instance.get()).thenReturn(service);
+        return new ResourceArnBuilder(new ObjectMapper(), instance);
+    }
+
+    /** A policy names the full ARN, so the check uses the stored one, path included. */
+    @Test
+    void iamNamesTheStoredEntityWithItsPath() {
+        ResourceArnBuilder stored = backedByEntities();
+        setFormBody("Action=DeleteUser&UserName=bob");
+        assertEquals("arn:aws:iam::000000000000:user/team/bob",
+                stored.build("iam", ctx, "us-east-1", "000000000000"));
+
+        setFormBody("Action=AttachRolePolicy&RoleName=app&PolicyArn=arn:aws:iam::aws:policy/ReadOnlyAccess");
+        assertEquals("arn:aws:iam::000000000000:role/svc/app",
+                stored.build("iam", ctx, "us-east-1", "000000000000"));
+
+        setFormBody("Action=AddRoleToInstanceProfile&InstanceProfileName=workers&RoleName=app");
+        assertEquals("arn:aws:iam::000000000000:instance-profile/nodes/workers",
+                stored.build("iam", ctx, "us-east-1", "000000000000"));
+
+        setFormBody("Action=DeleteRole&RoleName=missing");
+        assertEquals("*", stored.build("iam", ctx, "us-east-1", "000000000000"));
+    }
+
+    /** A create names an entity that does not exist yet, so its ARN comes from the request's Path. */
+    @Test
+    void iamMintsTheCreatedEntityFromTheRequestPath() {
+        setFormBody("Action=CreateRole&RoleName=app&Path=/svc/");
+        assertEquals("arn:aws:iam::000000000000:role/svc/app",
+                builder.build("iam", ctx, "us-east-1", "000000000000"));
+
+        setFormBody("Action=CreateInstanceProfile&InstanceProfileName=workers");
+        assertEquals("arn:aws-cn:iam::000000000000:instance-profile/workers",
+                builder.build("iam", ctx, "cn-north-1", "000000000000"));
+
+        setFormBody("Action=DeletePolicy&PolicyArn=arn:aws:iam::000000000000:policy/p");
+        assertEquals("arn:aws:iam::000000000000:policy/p",
+                builder.build("iam", ctx, "us-east-1", "000000000000"));
     }
 
     private void setJsonBody(String json) {
