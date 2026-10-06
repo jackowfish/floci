@@ -627,9 +627,9 @@ because listing goes through the user.
 marks it optional and it resolves from the access key that signed the request. That is the opposite
 of the signing-certificate operations, where it is optional throughout.
 
-Under [enforcement](#iam-enforcement-mode) these actions are evaluated against `*` rather than the
-owning user's ARN, along with every other IAM action except the server-certificate operations, which
-is the general gap tracked in [#4979](https://github.com/floci-io/floci/issues/4979).
+Under [enforcement](#iam-enforcement-mode) these actions are evaluated against the owning user's
+ARN when the request names `UserName`. A `ListSSHPublicKeys` call that leaves it out is evaluated
+against `*`.
 
 ### Signing Certificates
 
@@ -672,10 +672,9 @@ date, and `N/A` when the certificate is not `Active`, which is how the User Guid
 `GetAccountSummary`'s `AccountSigningCertificatesPresent` is unaffected: it reports the account root
 user's certificates, and Floci does not model root credentials.
 
-Under [enforcement](#iam-enforcement-mode) these actions are evaluated against `*` rather than the
-owning user's ARN, along with every other IAM action except the server-certificate operations. That
-is the general gap tracked in [#4979](https://github.com/floci-io/floci/issues/4979), not something
-specific to signing certificates.
+Under [enforcement](#iam-enforcement-mode) these actions are evaluated against the owning user's
+ARN when the request names `UserName`, and against `*` when it resolves the user from the signing
+key instead.
 
 ### Service-Specific Credentials
 
@@ -781,9 +780,8 @@ was minted rather than re-derived from the new name, because it is what the call
 with and rewriting it would break a working credential; AWS does not document which way it goes, so
 this is a choice rather than a sourced behaviour.
 
-Under [enforcement](#iam-enforcement-mode) these actions are evaluated against `*` rather than the
-owning user's ARN, as the general gap in
-[#4979](https://github.com/floci-io/floci/issues/4979) describes.
+Under [enforcement](#iam-enforcement-mode) these actions are evaluated against the owning user's
+ARN when the request names `UserName`, and against `*` otherwise.
 
 ## AWS Managed Policies
 
@@ -934,20 +932,19 @@ These identities always bypass enforcement (backward-compatible defaults):
 | No `Authorization` header | Allowed — unauthenticated path (e.g. health checks) |
 | Unresolvable IAM action for the request | Allowed — unknown mappings are permissive |
 
-**IAM's own resources are mostly not named.** When enforcement evaluates a request, the target
+**IAM's own resources are partly named.** When enforcement evaluates a request, the target
 resource comes from `ResourceArnBuilder`, which builds an ARN for S3, Lambda, SQS, SNS, DynamoDB,
-Kinesis, Secrets Manager, SSM, KMS, and, within IAM, only the server-certificate operations. Every
-other IAM action is evaluated against `*`, so a statement naming a specific user, role, policy,
-instance profile, MFA device or identity provider does not constrain it: a `Deny` on
-`arn:aws:iam::123456789012:user/bob` does not stop `DeleteUser` from running, and an `Allow`
-scoped to one role does not limit `DeleteRole` to it. Action-level matching works normally, so
-denying `iam:DeleteUser` outright does take effect; it is only the resource half that is missing.
+Kinesis, Secrets Manager, SSM, KMS, EC2, EventBridge rules, EKS clusters and IAM. Within IAM, a call
+that names an instance profile, group, role or user is evaluated against that entity's ARN, checked
+in that order, so `AddRoleToInstanceProfile` names the profile and `AddUserToGroup` names the group.
+The ARN is the stored one, path included; a `Create*` call mints it from the request's `Path`, and a
+call naming an entity that does not exist is evaluated against `*`. A call that names no entity but
+carries `PolicyArn` or `OpenIDConnectProviderArn` is evaluated against that ARN.
 
-This is the behaviour IAM has always had here rather than a recent change, and it errs toward
-permissive, which is the direction worth knowing about. Closing it means mapping the resource of
-every dispatched IAM action, which is tracked in
-[#4979](https://github.com/floci-io/floci/issues/4979) rather than bundled into the
-server-certificate work that mapped the first few.
+The rest is still evaluated against `*`: MFA devices, SAML providers, and `CreatePolicy`, which
+names a policy that has no ARN yet. An `UpdateUser` or `UpdateGroup` rename names only
+the current entity, unlike a certificate rename. Closing these gaps is tracked in
+[#4979](https://github.com/floci-io/floci/issues/4979).
 
 **A certificate rename names two resources.** `UpdateServerCertificate` is evaluated against both
 the certificate's current ARN and the ARN that `NewServerCertificateName` or `NewPath` would
