@@ -918,10 +918,10 @@ public class EksService implements TagHandler, ResourceProvider {
         if (nodeGroup.getLabels() != null) {
             labels.putAll(nodeGroup.getLabels());
         }
-        labels.put("eks.amazonaws.com/nodegroup", nodeGroup.getNodegroupName());
-        labels.put("eks.amazonaws.com/capacityType", nodeGroup.getCapacityType());
+        labels.put(EksClusterManager.NODEGROUP_LABEL, nodeGroup.getNodegroupName());
+        labels.put("eks.amazonaws.com/capacityType", nodeGroup.getCapacityType()); // partition-literal: a Kubernetes label key
         if (nodeGroup.getReleaseVersion() != null) {
-            labels.put("eks.amazonaws.com/nodegroup-image", nodeGroup.getReleaseVersion());
+            labels.put("eks.amazonaws.com/nodegroup-image", nodeGroup.getReleaseVersion()); // partition-literal: a Kubernetes label key
         }
         List<String> taints = kubeletTaints(nodeGroup.getTaints());
         String instanceType = nodeGroup.getInstanceTypes() == null || nodeGroup.getInstanceTypes().isEmpty()

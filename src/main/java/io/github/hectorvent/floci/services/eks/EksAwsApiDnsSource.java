@@ -29,8 +29,9 @@ public class EksAwsApiDnsSource implements DnsClientRecordSource {
     @Override
     public Optional<DnsAnswer> resolve(String name, int type, String clientAddress) {
         String lower = name.toLowerCase(Locale.ROOT);
-        if (!(lower.equals("amazonaws.com") || lower.endsWith(".amazonaws.com"))
-                || !clusterManager.forwardsAwsApi(clientAddress)) {
+        boolean awsName = EksClusterManager.awsDnsSuffixes().stream()
+                .anyMatch(suffix -> lower.equals(suffix) || lower.endsWith("." + suffix));
+        if (!awsName || !clusterManager.forwardsAwsApi(clientAddress)) {
             return Optional.empty();
         }
         // The forwarded address is IPv4 only, so other record types answer with no data.

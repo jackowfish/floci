@@ -9,6 +9,8 @@ import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.FlociCertificateAuthority;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsPartition;
+import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
@@ -2115,9 +2117,9 @@ public class EksClusterManager
         StringBuilder yaml = new StringBuilder();
         for (String region : regions) {
             yaml.append("  \"").append(EKS_ADDON_REGISTRY_ACCOUNT).append(".dkr.ecr.").append(region)
-                    .append(".amazonaws.com\":\n")
+                    .append('.').append(AwsRegions.dnsSuffixFor(region)).append("\":\n")
                     .append("    endpoint:\n")
-                    .append("      - \"https://public.ecr.aws\"\n")
+                    .append("      - \"https://public.ecr.aws\"\n") // partition-literal: ECR Public has one global host
                     .append("    rewrite:\n")
                     .append("      \"^amazon/(.*)\": \"eks/$1\"\n");
         }
@@ -2204,12 +2206,31 @@ public class EksClusterManager
                     .withRemotePath(K3S_DATA_DIR)
                     .exec();
         } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} pods resolve amazonaws.com to AWS itself: could not copy the DNS "
+            LOG.warnv("EKS cluster {0} pods resolve AWS hostnames to AWS itself: could not copy the DNS "
                     + "manifest into the k3s container: {1}", cluster.getName(), e.getMessage());
         }
     }
 
+    /** The DNS suffix of every AWS partition, such as amazonaws.com and amazonaws.com.cn. */
+    static List<String> awsDnsSuffixes() {
+        return AwsPartitions.all().stream().map(AwsPartition::dnsSuffix).distinct().toList();
+    }
+
     static String awsApiDnsManifest() {
+        StringBuilder servers = new StringBuilder();
+        for (String suffix : awsDnsSuffixes()) {
+            servers.append("""
+                        %1$s:53 {
+                            errors
+                            template IN A %1$s {
+                                answer "{{ .Name }} 60 IN A %2$s"
+                            }
+                            template IN AAAA %1$s {
+                                rcode NOERROR
+                            }
+                        }
+                    """.formatted(suffix, AWS_API_ADDRESS));
+        }
         return """
                 apiVersion: v1
                 kind: ConfigMap
@@ -2218,16 +2239,7 @@ public class EksClusterManager
                   namespace: kube-system
                 data:
                   floci-aws-api.server: |
-                    amazonaws.com:53 {
-                        errors
-                        template IN A amazonaws.com {
-                            answer "{{ .Name }} 60 IN A %s"
-                        }
-                        template IN AAAA amazonaws.com {
-                            rcode NOERROR
-                        }
-                    }
-                """.formatted(AWS_API_ADDRESS);
+                """ + servers;
     }
 
     /**
@@ -2650,7 +2662,7 @@ public class EksClusterManager
     /** An EKS-shaped hostname; the network's DNS maps it to the cluster container. */
     String eksHostname(Cluster cluster) {
         return cluster.getName() + "-" + resolveClusterAccountId(cluster) + ".gr7."
-                + clusterRegion(cluster) + ".eks.amazonaws.com";
+                + clusterRegion(cluster) + ".eks." + AwsRegions.dnsSuffixFor(clusterRegion(cluster));
     }
 
     String clusterRegion(Cluster cluster) {
@@ -3088,8 +3100,9 @@ public class EksClusterManager
     /** STS hostnames that aws-sdk-go v1 dials directly, since it has no endpoint override for STS. */
     static List<String> awsApiGatewayHostnames() {
         List<String> names = new ArrayList<>();
-        names.add("sts.amazonaws.com");
-        AwsRegions.advertised(AwsRegions.DEFAULT_PARTITION).stream().sorted().forEach(region -> names.add("sts." + region + ".amazonaws.com"));
+        names.add("sts." + AwsRegions.DEFAULT_DNS_SUFFIX);
+        AwsRegions.advertised(AwsRegions.DEFAULT_PARTITION).stream().sorted().forEach(region ->
+                names.add("sts." + region + "." + AwsRegions.dnsSuffixFor(region)));
         return names;
     }
 
@@ -3540,7 +3553,7 @@ public class EksClusterManager
     }
 
     static final String WORKER_NODE_LABEL = "floci.eks.worker-node";
-    static final String NODEGROUP_LABEL = "eks.amazonaws.com/nodegroup";
+    static final String NODEGROUP_LABEL = "eks.amazonaws.com/nodegroup"; // partition-literal: a Kubernetes label key, not a host
 
     /** The CSI driver each storage add-on registers, which Floci stands in for with local volumes. */
     static final Map<String, String> CSI_ADDON_DRIVERS = Map.of(
