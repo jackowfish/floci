@@ -530,8 +530,8 @@ class EksClusterManagerTest {
         void restoreClusterPreservesPreUpgradeLocalStorageWhenContainerSurvives() {
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(survivingContainer("cid-pre-upgrade")));
-            when(lifecycleManager.adopt("cid-pre-upgrade", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-pre-upgrade", Map.of(), Map.of(6443, 6512)));
+            when(lifecycleManager.adopt("cid-pre-upgrade", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-pre-upgrade", Map.of(), Map.of(443, 6512)));
 
             Cluster cluster = cluster();
             manager.restoreCluster(cluster);
@@ -546,8 +546,8 @@ class EksClusterManagerTest {
                     + "\"io.floci.eks.default-storage-class\":\"false\"}}");
             when(lifecycleManager.findByName("floci-eks-demo"))
                     .thenReturn(Optional.of(container));
-            when(lifecycleManager.adopt("cid-new", List.of(6443)))
-                    .thenReturn(new ContainerInfo("cid-new", Map.of(), Map.of(6443, 6512)));
+            when(lifecycleManager.adopt("cid-new", List.of(443)))
+                    .thenReturn(new ContainerInfo("cid-new", Map.of(), Map.of(443, 6512)));
 
             Cluster cluster = cluster();
             manager.restoreCluster(cluster);
